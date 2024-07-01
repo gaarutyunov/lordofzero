@@ -123,7 +123,7 @@ fn fragMain(
     // Fog
 	let fog_speed: vec2<f32> = vec2<f32>(0.2, 0.);
 	let fog_color: vec3<f32> = vec3<f32>(1., 1., 1.);
-    let fog_intensity: f32 = modulo2(time / 5.0, 1.0);
+    let fog_intensity: f32 = 0.3; //modulo2(time / 5.0, 1.0);
     let fog_amount: f32 = fog_intensity;
 	let fog_noise: f32 = 0.5;
 	let fog_noise_speed: f32 = 0.02;
@@ -131,7 +131,7 @@ fn fragMain(
     // Clouds
 	let cloud_speed: vec2<f32> = vec2<f32>(0.4, 0.);
 	let cloud_color: vec3<f32> = vec3<f32>(1., 1., 1.);
-    let cloud_intensity: f32 = modulo2(time / 5.0, 1.0);
+    let cloud_intensity: f32 = 0.3; //modulo2(time / 5.0, 1.0);
     let cloud_amount: f32 = cloud_intensity;
 	let cloud_noise: f32 = fog_noise*2.;
 	let cloud_noise_speed: f32 = fog_noise_speed*6.;
