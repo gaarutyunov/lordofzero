@@ -97,200 +97,33 @@ fn fragMain(
   @location(0) uv: vec2<f32>
 ) -> @location(0) vec4<f32> {
     // Background image
-    let c = textureSample(spriteTexture, spriteSampler, uv);
+    var c = textureSample(spriteTexture, spriteSampler, uv);
+    if (c.a <= 0.0) {
+        discard;
+    }
 
-    let time = uniforms.time + 50; // add 50s so that we're already into the animation starting
+    // Water reflections
+    let time: f32 = uniforms.time + 50; // add 50s so that we're already into the animation starting
     let water_height = 0.8;
     if (uv.y > water_height) {
         let iuv = vec2<f32>(uv.x, ((1.-uv.y) + water_height) - (1.-water_height));
-        let water_uv = vec2<f32>(uv.x, 1.-((1.0 - uv.y) * (1.0/(1.-water_height)))); // 0.0 at top of water, 1.0 at bottom of screen
-        // let rain_speed: f32 = 2.125;
-        // let rain_streak: f32 = 6.0;
-        // let rain_scale: f32 = 3.0;
-        // let c: f32 = 1. - fract((iuv.y * 0.5 + time * rain_speed + 0.1) * hash11(floor(iuv.y * 50. + uv_x * 150.)) * 0.5) * rain_streak;
-        //let noise = 1.- clamp(1. - fract((iuv.x * 0.5 + time * 0.1) * hash11(floor(iuv.y * 200. + iuv.x * 1.0))) * 15.0, 0., 1.);
-
-        //let noise_x = hash11(floor(iuv.x * 10.0 + time));
-        //let noise_y = hash11(floor(iuv.y * 100.0));
-        //let noise_xy = hash11(floor(noise_x * noise_y * 100.0));
-        //let noise_vx = hash11((iuv.x) * time) * 0.01;
-        //let noise_vy = hash11((iuv.y) * time) * 0.01;
-
-        // float waves = fract(hash11(floor(uv.y * 200.)) * 2.0 + fract(time * 0.02 + uv.x));
-        // float distortion = fract(hash11(floor(uv.y * 200.)) * 2.0 + fract(time * 0.02 + uv.x * 3.));
-        // distortion = step(0.5, distortion);
-        // float distortionAngle = fract(hash11(floor((iuv.y) * 200.)) * 2.0 + fract(time * 0.01 + iuv.x * 0.1)) * 97.0721;
-        // vec2 distortionVec = vec2(sin(distortionAngle), cos(distortionAngle));
-        // fragColor = texture(iChannel0, uv + distortionVec * distortion * 0.01) * 0.7; 
-     	// fragColor = mix(vec4(0.0), fragColor, clamp((-uv.y + 0.7) * 3.0, 0.0, 1.0));
 
         let waves = fract(hash11(floor((iuv.y) * 200.)) * 2.0 + fract(time * 0.02 + iuv.x));
         let distortion = step(0.5, fract(hash11(floor((iuv.y) * 150.)) * 2.0 + fract((time * 0.2) + iuv.x * 6.)));
         let distortion_angle = (fract(hash11(floor((iuv.y) * 150.)) * 2.0 + fract(time * 0.01 + iuv.x * 0.2))) * 97.0721;
         let distortion_vec = vec2(sin(distortion_angle), cos(distortion_angle));
 
-        // // fragColor = texture(iChannel0, uv + distortionVec * distortion * 0.01) * 0.7; 
-     	// // fragColor = mix(vec4(0.0), fragColor, clamp((-uv.y + 0.7) * 3.0, 0.0, 1.0));
-
-        // fragColor = vec4((uv + distortionVec * distortion * 0.01).x);
-        // return vec4<f32>(0., (vec2<f32>(iuv.x, iuv.y) + distortion_vec).x, 0., 1.);
-        // return vec4<f32>(0., distortion, 0., 1.);
-
         return mix(
             vec4<f32>(0.),
             textureSample(spriteTexture, spriteSampler, vec2<f32>(iuv.x, iuv.y) + distortion_vec * distortion * 0.01) * 0.7,
             clamp(((1.-iuv.y) + 0.7) * 3.0, 0., 1.),
         );
-        // // return mix(
-        // //     vec4<f32>(0.),
-        // //     textureSample(spriteTexture, spriteSampler, vec2<f32>(iuv.x, 1.-iuv.y) + distortion_vec * distortion * 0.01) * 0.7,
-        // //     clamp(((1.-iuv.y) + 0.7) * 3.0, 0., 1.),
-        // // );
-
-        // return vec4<f32>(0., distortion, 0., 1.);
-
-
-
-        // // let noise_x = hash11(floor(iuv.x * 10 + time * 0.2));
-        // // let noise_y = hash11(floor(iuv.y * 200 + time * 0.2));
-        // let nuv = vec2<f32>(iuv.x + noise_vx, iuv.y + noise_vy);
-        // // return vec4<f32>(0., nuv.y, 0., 1.);
-        // let c2 = textureSample(spriteTexture, spriteSampler, nuv);
-        // return c2;
     }
     return c;
-}
-
-// Straight (not premultiplied) alpha-over operation, drawing src over dst.
-fn alphaOver(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    const alpha: f32 = a.a + b.a * (1 - a.a);
-    const color: vec3<f32> = ((a.rgb * a.a) + (b.rgb * b.a * (1 - a.a))) / vec3<f32>(alpha);
-    return vec4<f32>(color, alpha);
-}
-
-// Cloud / fog alpha calculation
-fn cloudFog(uv: vec2<f32>, time: f32, is_clouds: f32, speed: vec2<f32>, noise: f32, noise_speed: f32, cloud_amount: f32, cloud_intensity: f32) -> f32 {
-    let invert = ((1.-is_clouds) - 0.5) * 2.0; // -1 if clouds, 1 otherwise
-	let height_additive: f32 = 1.-(cloud_amount * 1.2 * (1.0+is_clouds));
-	let density: f32 = 0.4;
-	let density_speed: f32 = 0.025;
-	let edge_sharpness_factor: f32 = 3.;
-	let intensity_factor: f32 = 1.;
-    let max_intensity = 0.75 + cloud_intensity;
-	let height_factor: f32 = 1.0;
-	let height_speed: f32 = -speed.x;
-    let uvv = vec2(uv.x, 1.-uv.y*invert) * 4.0;
-	let uvt: vec2<f32> = uvv + vec2<f32>(speed * time);
-	var v_noise: f32 = 0.5 + simplex3d_fractal(vec3<f32>(uvt, time * noise_speed) * noise * 1.);
-	v_noise = 1. - pow(1. - v_noise, intensity_factor);
-    let uvh = vec2(uv.x, 1.-uv.y) * 2.0 * invert;
-	let height_mask: f32 = clamp((loopNoise(uvt.x*0.9, 12.) * 1. - uvh.y * height_factor) - (height_additive), 0., 1.);
-	let height2_mask: f32 = clamp((loopNoise(uvt.x*0.8, 24.) * 1. - uvh.y * height_factor) - (height_additive), 0., 1.);
-    let mask: f32 = min(clamp(height2_mask - (1.-height_mask), 0., 1.), max_intensity);
-    return clamp(v_noise - (1.-mask), 0., 1.);
 }
 
 fn hash11(p: f32) -> f32 {
 	var p2: vec2<f32> = fract(vec2<f32>(p * 5.3983, p * 5.4427));
 	p2 = p2 + (dot(p2.yx, p2.xy + vec2<f32>(21.5351, 14.3137)));
 	return fract(p2.x * p2.y * 95.4337) * 0.5 + 0.5;
-} 
-
-//------------------------------------------------------------------------
-// simplex3d algorithm
-// ported from https://www.shadertoy.com/view/XsX3zB
-// The MIT License, Copyright © 2013 Nikita Miropolskiy
-//------------------------------------------------------------------------
-fn random3(c: vec3<f32>) -> vec3<f32> {
-	var j: f32 = 4096. * sin(dot(c, vec3<f32>(17., 59.4, 15.)));
-	var r: vec3<f32>;
-	r.z = fract(512. * j);
-	j = j * (0.125);
-	r.x = fract(512. * j);
-	j = j * (0.125);
-	r.y = fract(512. * j);
-	return r - 0.5;
-} 
-fn simplex3d(p: vec3<f32>) -> f32 {
-    let F3: f32 = 0.3333333;
-    let G3: f32 = 0.1666667;
-    let s: vec3<f32> = floor(p + dot(p, vec3<f32>(F3)));
-	var x: vec3<f32> = p - s + dot(s, vec3<f32>(G3));
-	let e: vec3<f32> = step(vec3<f32>(0.), x - x.yzx);
-	let i1: vec3<f32> = e * (1. - e.zxy);
-	let i2: vec3<f32> = 1. - e.zxy * (1. - e);
-	let x1: vec3<f32> = x - i1 + G3;
-	let x2: vec3<f32> = x - i2 + 2. * G3;
-	let x3: vec3<f32> = x - 1. + 3. * G3;
-	var w: vec4<f32>;
-	var d: vec4<f32>;
-	w.x = dot(x, x);
-	w.y = dot(x1, x1);
-	w.z = dot(x2, x2);
-	w.w = dot(x3, x3);
-	w = max(0.6 - w, vec4<f32>(0.));
-	d.x = dot(random3(s), x);
-	d.y = dot(random3(s + i1), x1);
-	d.z = dot(random3(s + i2), x2);
-	d.w = dot(random3(s + 1.), x3);
-	w = w * (w);
-	w = w * (w);
-	d = d * (w);
-	return dot(d, vec4<f32>(52.));
-} 
-fn simplex3d_fractal(m: vec3<f32>) -> f32 {
-    // rot1 mat3x3 rows
-    let rot1_1 = vec3<f32>(-0.37, 0.36, 0.85);
-    let rot1_2 = vec3<f32>(-0.14, -0.93, 0.34);
-    let rot1_3 = vec3<f32>(0.92, 0.01, 0.4);
-
-    // rot2 mat3x3 rows
-    let rot2_1 = vec3<f32>(-0.55, -0.39, 0.74);
-    let rot2_2 = vec3<f32>(0.33, -0.91, -0.24);
-    let rot2_3 = vec3<f32>(0.77, 0.12, 0.63);
-
-    // rot3 mat3x3 rows
-    let rot3_1 = vec3<f32>(-0.71, 0.52, -0.47);
-    let rot3_2 = vec3<f32>(-0.08, -0.72, -0.68);
-    let rot3_3 = vec3<f32>(-0.7, -0.45, 0.56);
-
-    let m_rot1 = mat3x3TimesVector(rot1_1, rot1_2, rot1_3, m);
-    let m_rot2 = mat3x3TimesVector(rot2_1, rot2_2, rot2_3, m);
-    let m_rot3 = mat3x3TimesVector(rot3_1, rot3_2, rot3_3, m);
-
-    return 0.5333333 * simplex3d(m_rot2) + 0.2666667 * simplex3d(2. * m_rot2) + 0.1333333 * simplex3d(4. * m_rot3) + 0.0666667 * simplex3d(8. * m);
-} 
-fn hash(n: f32) -> f32 {
-	return fract(sin(n) * 10000.);
-} 
-fn loopNoise(x: f32, loopLen: f32) -> f32 {
-    let xv: f32 = modulo(x, loopLen);
-	let i: f32 = floor(xv);
-	let f: f32 = fract(xv);
-	let u: f32 = f * f * f * (f * (f * 6. - 15.) + 10.);
-	return mix(hash(i), hash(modulo(i + 1., loopLen)), u);
 }
-fn modulo(x: f32, y: f32) -> f32 {
-    return x - y * floor(x/y);
-}
-fn modulo2(x: f32, y: f32) -> f32 {
-    return x - y * floor(x/y);
-}
-fn mat3x3TimesVector(r1: vec3<f32>, r2: vec3<f32>, r3: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
-    var result = vec3<f32>(0,0,0);    
-    for (var row = 0; row < 3; row++) {
-        for (var col = 0; col < 3; col++) {
-            if (row == 0) {
-                result[col] += r1[col] * v[row];
-            } else if (row == 1) {
-                result[col] += r2[col] * v[row];
-            } else if (row == 2) {
-                result[col] += r3[col] * v[row];
-            }
-        }
-    }
-    return result;
-}
-//------------------------------------------------------------------------
-// end simplex3d algorithm
-//------------------------------------------------------------------------

@@ -96,28 +96,6 @@ fn vertMain(
 fn fragMain(
   @location(0) uv: vec2<f32>
 ) -> @location(0) vec4<f32> {
-    // // start screen 'dragon claws' effect
-    // let time = uniforms.time + 50; // add 50s so that we're already into the animation starting
-    // let uv_x = uv.x;
-    // let uv_y = (1.0-uv.y);
-	// let c: f32 = 1. - fract((uv_y * 1.5 + time * 0.2) * hash11(floor(1. / uv_y * 10. + uv_x * 150.)) * 1.5 + 0.4);
-	// let sky: vec3<f32> = vec3<f32>(0.5, 0.7, 0.8) * ((uv_x * 0.75) - 0.5);
-	// return vec4<f32>(mix(vec3<f32>(0., 0., 0.), sky, c), 1.);
-
-    // // rain
-    // let time = uniforms.time + 50; // add 50s so that we're already into the animation starting
-    // let rain_speed: f32 = 2.125;
-	// let rain_streak: f32 = 6.0;
-    // let rain_scale: f32 = 3.0;
-    // let uv_x = uv.x * rain_scale;
-    // let uv_y = (1.0-uv.y) * rain_scale;
-	// let c: f32 = 1. - fract((uv_y * 0.5 + time * rain_speed + 0.1) * hash11(floor(uv_y * 50. + uv_x * 150.)) * 0.5) * rain_streak;
-	// let droplet: vec3<f32> = vec3<f32>(0.5, 0.7, 0.8) * 1.5;
-    // if (c * 0.2 <= 0.0) {
-    //     discard;
-    // }
-	// return vec4<f32>(mix(vec3<f32>(0., 0., 0.), droplet, c * 0.2), c * 0.4);
-
     // Clouds and fog
     let time: f32 = uniforms.time + 50; // add 50s so that we're already into the animation starting
     // Fog
@@ -141,13 +119,6 @@ fn fragMain(
     let color = alphaOver(vec4<f32>(fog_color, fog_alpha), vec4<f32>(cloud_color, cloud_alpha));
     if (color.a <= 0.0) { discard; }
     return color;
-
-    // // Background image
-    // var c = textureSample(spriteTexture, spriteSampler, fragUV);
-    // if (c.a <= 0.0) {
-    //     discard;
-    // }
-    // return c;
 }
 
 // Straight (not premultiplied) alpha-over operation, drawing src over dst.
