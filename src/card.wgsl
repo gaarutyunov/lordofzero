@@ -15,9 +15,7 @@ struct Uniforms {
   view_projection: mat4x4<f32>,
 
   // Total size of the sprite texture in pixels
-  texture_size: vec2<f32>,
-
-  time: f32,
+  texture_size: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
@@ -27,7 +25,7 @@ struct Uniforms {
 
 // Sprite UV coordinate transformation matrices. Sprite UV coordinates are (0, 0) at the top-left
 // corner, and in pixels.
-@group(0) @binding(2) var<storage, read> sprite_uv_transforms: array<mat3x3<f32>>;
+@group(0) @binding(2) var<storage, read> sprite_uv_transforms: array<mat4x4<f32>>;
 
 // Sprite sizes, in pixels.
 @group(0) @binding(3) var<storage, read> sprite_sizes: array<vec2<f32>>;
@@ -77,8 +75,8 @@ fn vertMain(
   pos = uniforms.view_projection * pos; // pixels -> normalized
 
   uv *= sprite_size; // normalized -> pixels
-  uv = (sprite_uv_transform * vec3<f32>(uv, 1)).xy; // apply sprite UV transform (pixels)
-  uv /= uniforms.texture_size; // pixels -> normalized
+  uv = (sprite_uv_transform * vec4<f32>(uv, 1, 0)).xy; // apply sprite UV transform (pixels)
+  uv /= uniforms.texture_size.xy; // pixels -> normalized
 
   var output : VertexOutput;
   output.Position = pos;
@@ -97,7 +95,7 @@ fn fragMain(
   @location(0) uv: vec2<f32>
 ) -> @location(0) vec4<f32> {
     // Clouds and fog
-    let time: f32 = uniforms.time + 50; // add 50s so that we're already into the animation starting
+    let time: f32 = uniforms.texture_size.z + 50; // add 50s so that we're already into the animation starting
     // Fog
 	let fog_speed: vec2<f32> = vec2<f32>(0.2, 0.);
 	let fog_color: vec3<f32> = vec3<f32>(1., 1., 1.);

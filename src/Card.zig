@@ -25,10 +25,8 @@ const Uniforms = extern struct {
     /// The view * orthographic projection matrix
     view_projection: math.Mat4x4 align(16),
 
-    /// Total size of the card texture in pixels
-    texture_size: math.Vec2 align(8),
-
-    time: f32 align(4),
+    /// Total size of the card texture in pixels (xy), time (z), unused (w)
+    texture_size: math.Vec4 align(16),
 };
 
 const BuiltPipeline = struct {
@@ -280,7 +278,7 @@ fn rebuildPipeline(
             .entries = &.{
                 gpu.BindGroup.Entry.initBuffer(0, uniforms, 0, @sizeOf(Uniforms), @sizeOf(Uniforms)),
                 gpu.BindGroup.Entry.initBuffer(1, transforms, 0, @sizeOf(math.Mat4x4) * buffer_cap, @sizeOf(math.Mat4x4)),
-                gpu.BindGroup.Entry.initBuffer(2, uv_transforms, 0, @sizeOf(math.Mat3x3) * buffer_cap, @sizeOf(math.Mat3x3)),
+                gpu.BindGroup.Entry.initBuffer(2, uv_transforms, 0, @sizeOf(math.Mat4x4) * buffer_cap, @sizeOf(math.Mat4x4)),
                 gpu.BindGroup.Entry.initBuffer(3, sizes, 0, @sizeOf(math.Vec2) * buffer_cap, @sizeOf(math.Vec2)),
                 gpu.BindGroup.Entry.initSampler(4, texture_sampler),
                 gpu.BindGroup.Entry.initTextureView(5, pipeline.texture_view),
@@ -444,8 +442,13 @@ fn renderPipeline(
     const uniforms = Uniforms{
         .view_projection = view_projection,
         // TODO(card): dimensions of multi-textures, number of multi-textures present
-        .texture_size = pipeline.texture_view_size,
-        .time = pipeline.time,
+        // Pack texture_size (xy), time (z), unused (w) into a single vec4
+        .texture_size = vec4(
+            pipeline.texture_view_size.x(),
+            pipeline.texture_view_size.y(),
+            pipeline.time,
+            0,
+        ),
     };
     encoder.writeBuffer(pipeline.built.?.uniforms, 0, &[_]Uniforms{uniforms});
     var command = encoder.finish(&.{ .label = label });
