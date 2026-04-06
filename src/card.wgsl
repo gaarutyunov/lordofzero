@@ -121,8 +121,10 @@ fn fragMain(
 
 // Straight (not premultiplied) alpha-over operation, drawing src over dst.
 fn alphaOver(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    const alpha: f32 = a.a + b.a * (1 - a.a);
-    const color: vec3<f32> = ((a.rgb * a.a) + (b.rgb * b.a * (1 - a.a))) / vec3<f32>(alpha);
+    let alpha: f32 = a.a + b.a * (1 - a.a);
+    // Guard against division by zero — NaN colors corrupt NVIDIA blend output even at alpha=0.
+    let safe_alpha: f32 = max(alpha, 0.00001);
+    let color: vec3<f32> = ((a.rgb * a.a) + (b.rgb * b.a * (1 - a.a))) / vec3<f32>(safe_alpha);
     return vec4<f32>(color, alpha);
 }
 
@@ -140,7 +142,6 @@ fn cloudFog(uv: vec2<f32>, time: f32, is_clouds: f32, speed: vec2<f32>, noise: f
     let uvv = vec2(uv.x, 1.-uv.y*invert) * 4.0;
 	let uvt: vec2<f32> = uvv + vec2<f32>(speed * time);
 	var v_noise: f32 = 0.5 + simplex3d_fractal(vec3<f32>(uvt, time * noise_speed) * noise * 1.);
-	v_noise = 1. - pow(1. - v_noise, intensity_factor);
     let uvh = vec2(uv.x, 1.-uv.y) * 2.0 * invert;
 	let height_mask: f32 = clamp((loopNoise(uvt.x*0.9, 12.) * 1. - uvh.y * height_factor) - (height_additive), 0., 1.);
 	let height2_mask: f32 = clamp((loopNoise(uvt.x*0.8, 24.) * 1. - uvh.y * height_factor) - (height_additive), 0., 1.);
@@ -160,14 +161,27 @@ fn hash11(p: f32) -> f32 {
 // The MIT License, Copyright © 2013 Nikita Miropolskiy
 //------------------------------------------------------------------------
 fn random3(c: vec3<f32>) -> vec3<f32> {
-	var j: f32 = 4096. * sin(dot(c, vec3<f32>(17., 59.4, 15.)));
-	var r: vec3<f32>;
-	r.z = fract(512. * j);
-	j = j * (0.125);
-	r.x = fract(512. * j);
-	j = j * (0.125);
-	r.y = fract(512. * j);
-	return r - 0.5;
+	// Permutation polynomial hash (Ashima webgl-noise) — no sin, no fract of large values.
+	let cz = c.z - floor(c.z * (1.0 / 289.0)) * 289.0;
+	let cy = c.y - floor(c.y * (1.0 / 289.0)) * 289.0;
+	let cx = c.x - floor(c.x * (1.0 / 289.0)) * 289.0;
+	var p = (cz * 34.0 + 10.0) * cz;
+	p = p - floor(p * (1.0 / 289.0)) * 289.0;
+	p = p + cy;
+	p = (p * 34.0 + 10.0) * p;
+	p = p - floor(p * (1.0 / 289.0)) * 289.0;
+	p = p + cx;
+	var j = (p * 34.0 + 10.0) * p;
+	j = j - floor(j * (1.0 / 289.0)) * 289.0;
+	let j2 = (j * 34.0 + 10.0) * j;
+	let j2m = j2 - floor(j2 * (1.0 / 289.0)) * 289.0;
+	let j3 = (j2m * 34.0 + 10.0) * j2m;
+	let j3m = j3 - floor(j3 * (1.0 / 289.0)) * 289.0;
+	return vec3<f32>(
+		fract(j * (1.0 / 41.0)),
+		fract(j2m * (1.0 / 41.0)),
+		fract(j3m * (1.0 / 41.0))
+	) - 0.5;
 } 
 fn simplex3d(p: vec3<f32>) -> f32 {
     let F3: f32 = 0.3333333;
@@ -219,7 +233,10 @@ fn simplex3d_fractal(m: vec3<f32>) -> f32 {
     return 0.5333333 * simplex3d(m_rot2) + 0.2666667 * simplex3d(2. * m_rot2) + 0.1333333 * simplex3d(4. * m_rot3) + 0.0666667 * simplex3d(8. * m);
 } 
 fn hash(n: f32) -> f32 {
-	return fract(sin(n) * 10000.);
+	// Same approach as hash11 — no sin(), portable across GPUs.
+	var p = fract(vec2<f32>(n * 5.3983, n * 5.4427));
+	p = p + dot(p.yx, p.xy + vec2<f32>(21.5351, 14.3137));
+	return fract(p.x * p.y * 95.4337);
 } 
 fn loopNoise(x: f32, loopLen: f32) -> f32 {
     let xv: f32 = modulo(x, loopLen);
@@ -235,18 +252,10 @@ fn modulo2(x: f32, y: f32) -> f32 {
     return x - y * floor(x/y);
 }
 fn mat3x3TimesVector(r1: vec3<f32>, r2: vec3<f32>, r3: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
-    var result = vec3<f32>(0,0,0);    
-    for (var row = 0; row < 3; row++) {
-        for (var col = 0; col < 3; col++) {
-            if (row == 0) {
-                result[col] += r1[col] * v[row];
-            } else if (row == 1) {
-                result[col] += r2[col] * v[row];
-            } else if (row == 2) {
-                result[col] += r3[col] * v[row];
-            }
-        }
-    }
+    var result: vec3<f32>;
+    result.x = r1.x * v.x + r2.x * v.y + r3.x * v.z;
+    result.y = r1.y * v.x + r2.y * v.y + r3.y * v.z;
+    result.z = r1.z * v.x + r2.z * v.y + r3.z * v.z;
     return result;
 }
 //------------------------------------------------------------------------
