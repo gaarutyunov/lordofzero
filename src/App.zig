@@ -27,6 +27,7 @@ pub const mach_systems = .{
     .main,
     .init,
     .tick,
+    .render,
     .deinit,
     .deinit2,
     .audioStateChange,
@@ -70,6 +71,9 @@ pub const tick = mach.schedule(.{
     .{ App, .updateAnims },
     .{ App, .updateSfx },
     .{ App, .updateCamera },
+});
+
+pub const render = mach.schedule(.{
     .{ App, .renderFrame },
 });
 
@@ -161,6 +165,7 @@ pub fn init(
         .title = "Lord of Zero",
         .width = 1920.0 * (3.0 / 4.0),
         .height = 1080.0 * (3.0 / 4.0),
+        .on_render = app_mod.id.render,
         // Make the window fullscreen before it opens, if you want:
         // .fullscreen = true,
     });
@@ -1274,7 +1279,8 @@ pub fn renderFrame(
     defer encoder.release();
 
     // Grab the back buffer of the swapchain once per frame (can only be called once)
-    const back_buffer_view = window.swap_chain.getCurrentTextureView().?;
+    // TODO(core): this wouldn't exist in browser
+    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return;
     defer back_buffer_view.release();
 
     // First render pass
