@@ -1,8 +1,18 @@
 const std = @import("std");
 
+const SysgpuBackend = enum {
+    default,
+    webgpu,
+    d3d12,
+    metal,
+    vulkan,
+    opengl,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sysgpu_backend = b.option(SysgpuBackend, "sysgpu_backend", "sysgpu API backend") orelse .default;
 
     const assets = b.addModule("assets", .{
         .root_source_file = b.path("assets/main.zig"),
@@ -21,6 +31,7 @@ pub fn build(b: *std.Build) void {
     const mach_dep = b.dependency("mach", .{
         .target = target,
         .optimize = optimize,
+        .sysgpu_backend = sysgpu_backend,
     });
     exe.root_module.addImport("mach", mach_dep.module("mach"));
 
