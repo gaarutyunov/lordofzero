@@ -4,8 +4,8 @@
     .mach_zig_version = "2024.11.0-mach",
     .dependencies = .{
         .mach = .{
-            .url = "https://pkg.hexops.org/pkg/hexops/mach/314182739843eab75287b34d4a1773328d9f436d.tar.gz",
-            .hash = "1220f40a717f1d1e5d56291b3449e2409679dc4d24feb40ab6dde501f0253271d610",
+            .url = "https://pkg.hexops.org/pkg/hexops/mach/24f650207b0505264348652c93aef520d4813f6f.tar.gz",
+            .hash = "122030db2ec2dba4ad9f8e94bd61bbef5a7d330f21ea65cb02cde93f6d5ae3fbd9dc",
         },
         .zigimg = .{
             .url = "https://github.com/zigimg/zigimg/archive/48bfe6d413a5b3723a7bcf36f1fabbba30efef68.tar.gz",
