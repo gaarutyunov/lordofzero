@@ -17,8 +17,6 @@ zig-out/
 /build-*/
 /docgen_tmp/
 
-.DS_Store
-
 src/core/examples/libs/
 assets/src/references/
 assets/src/pixi-ldtk/
