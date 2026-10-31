@@ -27,11 +27,17 @@ pub const mach_systems = .{
     .main,
     .init,
     .tick,
+    .update,
+    .cleanup,
+    .snapshotFrame,
     .render,
     .deinit,
+    .deinitApp,
     .deinit2,
     .audioStateChange,
     .pollInput,
+    .cleanupSprites,
+    .snapshot,
     .changeScene,
     .updateScene,
     .updateSceneStart,
@@ -55,22 +61,52 @@ pub const mach_tags = .{
 pub const main = mach.schedule(.{
     .{ mach.Core, .init },
     .{ mach.Audio, .init },
+    .{ gfx.Sprite, .init },
     .{ gfx.Text, .init },
+    .{ Card, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
 
 pub const deinit = mach.schedule(.{
-    .{ mach.Audio, .deinit },
+    .{ App, .deinitApp },
     .{ App, .deinit2 },
+    .{ mach.Audio, .deinit },
 });
 
+/// Runs in a loop on the app thread (see mach.startThread in App.init.)
 pub const tick = mach.schedule(.{
+    .{ App, .update },
+    .{ App, .cleanup },
+    .{ App, .snapshotFrame },
+});
+
+pub const update = mach.schedule(.{
     .{ App, .pollInput },
     .{ App, .updateScene },
     .{ App, .updateAnims },
     .{ App, .updateSfx },
     .{ App, .updateCamera },
+});
+
+/// Frees objects deleted this tick. App sprites must be freed before gfx sprites, since they are
+/// children of gfx sprites in the object graph.
+pub const cleanup = mach.schedule(.{
+    .{ App, .cleanupSprites },
+    .{ gfx.Sprite, .cleanup },
+    .{ gfx.Text, .cleanup },
+    .{ Card, .cleanup },
+    .{ mach.Audio, .cleanup },
+});
+
+/// Hands off a snapshot of the frame to the render thread.
+pub const snapshotFrame = mach.schedule(.{
+    .{ mach.Core, .snapshotStart },
+    .{ gfx.Sprite, .snapshot },
+    .{ gfx.Text, .snapshot },
+    .{ Card, .snapshot },
+    .{ App, .snapshot },
+    .{ mach.Core, .snapshotEnd },
 });
 
 pub const render = mach.schedule(.{
@@ -88,6 +124,8 @@ const world_scale = 2.0;
 
 // Initialized by App.init
 allocator: std.mem.Allocator,
+io: std.Io,
+app_thread: mach.Thread,
 window_id: mach.ObjectID,
 direction: Vec2 = vec2(0, 0),
 last_direction: Vec2 = vec2(0, 0),
@@ -100,13 +138,9 @@ attack_cooldown: f32 = 1.0,
 attack_cooldown_timer: time.Timer,
 is_attacking: bool = false,
 delta_timer: time.Timer,
-spawn_timer: time.Timer,
-fps_timer: time.Timer,
 player_sprite_timer: time.Timer,
 delta_time: f32 = 0,
 player_anim_frame: isize = -1,
-frame_count: usize = 0,
-fps: usize = 0,
 rand: std.Random.DefaultPrng,
 world_time: f32 = 0,
 scene: Scene = .start,
@@ -114,7 +148,31 @@ prev_scene: Scene = .none,
 pending_scene: ?Scene = null,
 pending_scene_timer: time.Timer = undefined,
 
-// Initialized by setupPipeline
+// Decoded sound effects, copied into a fresh mach.Audio buffer each time they are played.
+sfx_morning_bells: mach.Audio.Opus,
+sfx_footsteps: mach.Audio.Opus,
+sfx_freeze: mach.Audio.Opus,
+sfx_grimble: mach.Audio.Opus,
+
+/// Whether setupPipelines has run (app thread only.)
+ready: bool = false,
+
+/// GPU resources created by the render thread, see setupGpu. Once `gpu_ready` is set (by the
+/// render thread), the app thread may read `gpu_res`. `gpu_res.rtt_view` is only ever replaced by the
+/// render thread, and is handed to the app thread via `pending_rtt`.
+gpu_res: Gpu = undefined,
+gpu_ready: std.atomic.Value(bool) = .init(false),
+
+/// A newly (re)created render-to-texture view, created by the render thread on resize and handed
+/// over to the app thread so that it can update the RTT card pipeline. Guarded by pending_rtt_mu.
+pending_rtt: ?PendingRtt = null,
+pending_rtt_mu: std.Io.Mutex = .init,
+
+/// App state read by the render thread. Written only during App.snapshot (while the app thread
+/// holds the render snapshot lock.)
+render_state: RenderState = .{},
+
+// Initialized by setupPipelines
 player_id: mach.ObjectID = undefined,
 
 // Game-level data associated with every sprite.
@@ -138,23 +196,45 @@ text_pipeline_id: mach.ObjectID = undefined,
 parsed_atlas: pixi.ParsedAtlas = undefined,
 parsed_level: ldtk.ParsedFile = undefined,
 parsed_ldtk_compatibility: pixi.ParsedLDTKCompatibility = undefined,
-rtt_texture_view: *gpu.TextureView = undefined,
-// TODO: textures don't store their width, so we have to store it ourselves here.
-// Mach should expose texture width as an object field.
-rtt_width: u32 = 0,
-rtt_height: u32 = 0,
 
-// Text resources that need to be freed
-text_segments: ?[]gfx.Text.Segment = null,
-text_content: ?[]u8 = null,
+const Gpu = struct {
+    /// Sprite atlas texture.
+    atlas_texture: *gpu.Texture,
+    /// View of the sprite atlas, used by the cloud cards only for its dimensions.
+    cloud_view: *gpu.TextureView,
+    cloud_view_size: Vec2,
+    pass1_shader: *gpu.ShaderModule,
+
+    /// Render-to-texture target the scene is rendered into for post-processing. Owned by the
+    /// render thread.
+    rtt_view: *gpu.TextureView,
+    rtt_width: u32,
+    rtt_height: u32,
+};
+
+const PendingRtt = struct {
+    view: *gpu.TextureView,
+    width: u32,
+    height: u32,
+};
+
+const RenderState = struct {
+    ready: bool = false,
+    scene: Scene = .none,
+    sprite_pipeline_id: mach.ObjectID = undefined,
+    text_pipeline_id: mach.ObjectID = undefined,
+    rtt_card_pipeline_id: mach.ObjectID = undefined,
+    cloud_card_pipeline_id: mach.ObjectID = undefined,
+};
 
 pub fn init(
     core: *mach.Core,
+    core_mod: mach.Mod(mach.Core),
     audio: *mach.Audio,
     app: *App,
     app_mod: mach.Mod(App),
+    io: std.Io,
 ) !void {
-    core.on_tick = app_mod.id.tick;
     core.on_exit = app_mod.id.deinit;
 
     // Configure the audio module to call our App.audioStateChange function when a sound buffer
@@ -173,17 +253,40 @@ pub fn init(
     // TODO(allocator): find a better way to get an allocator here
     const allocator = std.heap.c_allocator;
 
+    // Load pixi atlas file
+    const parsed_atlas = try pixi.Atlas.parseSlice(allocator, assets.lordofzero_atlas);
+    std.debug.print("loaded sprite atlas: {} sprites, {} animations\n", .{
+        parsed_atlas.value.sprites.len,
+        parsed_atlas.value.animations.len,
+    });
+
     app.* = .{
         .allocator = allocator,
+        .io = io,
+        .app_thread = undefined,
         .window_id = window_id,
         .sprites = app.sprites,
-        .attack_cooldown_timer = try time.Timer.start(),
-        .delta_timer = try time.Timer.start(),
-        .spawn_timer = try time.Timer.start(),
-        .fps_timer = try time.Timer.start(),
-        .player_sprite_timer = try time.Timer.start(),
+        .attack_cooldown_timer = time.Timer.start(io),
+        .delta_timer = time.Timer.start(io),
+        .player_sprite_timer = time.Timer.start(io),
         .rand = std.Random.DefaultPrng.init(1337),
+        .parsed_atlas = parsed_atlas,
+        .parsed_ldtk_compatibility = try pixi.LDTKCompatibility.parseSlice(allocator, assets.pixi_ldtk_json),
+        // Preload .ldtk level file
+        .parsed_level = try ldtk.File.parseSlice(allocator, assets.level_ldtk),
+        .sfx_morning_bells = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.morning_bells }),
+        .sfx_footsteps = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.footsteps }),
+        .sfx_freeze = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.freeze }),
+        .sfx_grimble = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.grimble }),
     };
+
+    // Start the app thread last, once app state is fully initialized.
+    app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
+}
+
+/// Stops the app thread. Runs first on exit, so the remaining deinit steps don't race with it.
+pub fn deinitApp(app: *App) void {
+    app.app_thread.join();
 }
 
 pub fn deinit2(
@@ -196,73 +299,84 @@ pub fn deinit2(
     // Clean up whatever scene is currently active
     clearCurrentScene(app, audio, sprite, card, text);
 
+    app.allocator.free(app.sfx_morning_bells.samples);
+    app.allocator.free(app.sfx_footsteps.samples);
+    app.allocator.free(app.sfx_freeze.samples);
+    app.allocator.free(app.sfx_grimble.samples);
+
     app.parsed_atlas.deinit();
     app.parsed_level.deinit();
-    app.rtt_texture_view.release();
+    app.parsed_ldtk_compatibility.deinit();
+    if (app.gpu_ready.load(.acquire)) app.gpu_res.rtt_view.release();
 }
 
-fn setupPipeline(
-    core: *mach.Core,
+/// Creates GPU resources. Called once on the render thread, since that is where all GPU work
+/// happens. The app thread picks these up in setupPipelines once `gpu_ready` is set.
+fn setupGpu(app: *App, window: anytype) !void {
+    // Create the texture we'll render our scene to for post-processing effects.
+    // Sized to the window's framebuffer (actual pixel dimensions including DPI scaling).
+    // Recreated on window resize in renderFrame.
+    const rtt_view = createRttView(window.device, window.framebuffer_width, window.framebuffer_height);
+
+    // The cloud card pipeline's texture_view is the sprite atlas — not sampled by the shader, but
+    // its dimensions (texture_view_size) determine the UV scale that the cloud function sees.
+    const cloud_texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png);
+    defer cloud_texture.release();
+
+    app.gpu_res = .{
+        .atlas_texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png),
+        .cloud_view = cloud_texture.createView(null),
+        .cloud_view_size = vec2(@floatFromInt(cloud_texture.getWidth()), @floatFromInt(cloud_texture.getHeight())),
+        .pass1_shader = window.device.createShaderModuleWGSL("pass1.wgsl", @embedFile("pass1.wgsl")),
+        .rtt_view = rtt_view,
+        .rtt_width = window.framebuffer_width,
+        .rtt_height = window.framebuffer_height,
+    };
+    app.gpu_ready.store(true, .release);
+}
+
+fn createRttView(device: *gpu.Device, width: u32, height: u32) *gpu.TextureView {
+    const rtt_texture = device.createTexture(&gpu.Texture.Descriptor.init(.{
+        .size = .{ .width = width, .height = height },
+        .format = .bgra8_unorm,
+        .usage = .{ .texture_binding = true, .copy_dst = true, .render_attachment = true },
+    }));
+    defer rtt_texture.release(); // view retains the texture
+    return rtt_texture.createView(null);
+}
+
+/// Creates the render pipelines and loads the initial scene. Called on the app thread once the
+/// render thread has created our GPU resources.
+fn setupPipelines(
     app: *App,
     app_mod: mach.Mod(App),
     sprite: *gfx.Sprite,
     card: *Card,
     text: *gfx.Text,
-    window_id: mach.ObjectID,
 ) !void {
-    const window = core.windows.getValue(window_id);
-
-    // Load pixi atlas file
-    app.parsed_atlas = try pixi.Atlas.parseSlice(app.allocator, assets.lordofzero_atlas);
-    std.debug.print("loaded sprite atlas: {} sprites, {} animations\n", .{
-        app.parsed_atlas.value.sprites.len,
-        app.parsed_atlas.value.animations.len,
-    });
-
-    app.parsed_ldtk_compatibility = try pixi.LDTKCompatibility.parseSlice(app.allocator, assets.pixi_ldtk_json);
-
-    // Preload .ldtk level file
-    app.parsed_level = try ldtk.File.parseSlice(app.allocator, assets.level_ldtk);
-
-    // Create the texture we'll render our scene to for post-processing effects.
-    // Sized to the window's framebuffer (actual pixel dimensions including DPI scaling).
-    // Recreated on window resize in updateCamera.
-    app.rtt_width = window.framebuffer_width;
-    app.rtt_height = window.framebuffer_height;
-    const rtt_texture = window.device.createTexture(&gpu.Texture.Descriptor.init(.{
-        .size = .{ .width = app.rtt_width, .height = app.rtt_height },
-        .format = .bgra8_unorm,
-        .usage = .{ .texture_binding = true, .copy_dst = true, .render_attachment = true },
-    }));
-    app.rtt_texture_view = rtt_texture.createView(null);
-    rtt_texture.release(); // view retains the texture
+    const g = app.gpu_res;
 
     // Create render-to-texture card with pass1.wgsl shader (water reflections + clouds/fog)
     app.rtt_card_pipeline_id = try card.pipelines.new(.{
-        .window = window_id,
-        .render_pass = undefined,
-        .texture_view = app.rtt_texture_view,
-        .texture_view_size = vec2(@floatFromInt(app.rtt_width), @floatFromInt(app.rtt_height)),
+        .window = app.window_id,
+        .texture_view = g.rtt_view,
+        .texture_view_size = vec2(@floatFromInt(g.rtt_width), @floatFromInt(g.rtt_height)),
         .blend_state = gpu.BlendState{},
-        .shader = window.device.createShaderModuleWGSL("pass1.wgsl", @embedFile("pass1.wgsl")),
+        .shader = g.pass1_shader,
     });
     app.rtt_card_id = try card.objects.new(.{
         .transform = Mat4x4.translate(vec3(0, 0, 0)),
         .uv_transform = Mat3x3.translate(vec2(0, 0)),
-        .size = vec2(@floatFromInt(app.rtt_width), @floatFromInt(app.rtt_height)),
+        .size = vec2(@floatFromInt(g.rtt_width), @floatFromInt(g.rtt_height)),
     });
-    try card.pipelines.setParent(app.rtt_card_id, app.rtt_card_pipeline_id);
+    try addToRenderList(card, app.allocator, app.rtt_card_pipeline_id, app.rtt_card_id);
 
     // Create cloud card pipeline (rendered in the RTT pass on top of sprites, using card.wgsl
-    // clouds-only shader). The texture_view is the sprite atlas — not sampled by the shader, but
-    // its dimensions (texture_view_size) determine the UV scale that the cloud function sees.
-    const cloud_texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png);
-    defer cloud_texture.release();
+    // clouds-only shader).
     app.cloud_card_pipeline_id = try card.pipelines.new(.{
-        .window = window_id,
-        .render_pass = undefined,
-        .texture_view = cloud_texture.createView(null),
-        .texture_view_size = vec2(@floatFromInt(cloud_texture.getWidth()), @floatFromInt(cloud_texture.getHeight())),
+        .window = app.window_id,
+        .texture_view = g.cloud_view,
+        .texture_view_size = g.cloud_view_size,
         // Alpha blend must preserve destination alpha so that cloud edges don't corrupt
         // the RTT texture's alpha channel (which would cause semi-transparency when the
         // RTT card renders to screen).
@@ -282,25 +396,96 @@ fn setupPipeline(
 
     // Create a sprite rendering pipeline
     app.sprite_pipeline_id = try sprite.pipelines.new(.{
-        .window = window_id,
-        .render_pass = undefined,
-        .texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png),
+        .window = app.window_id,
+        .texture = g.atlas_texture,
     });
 
     // Create a text rendering pipeline
     app.text_pipeline_id = try text.pipelines.new(.{
-        .window = window_id,
-        .render_pass = undefined,
+        .window = app.window_id,
     });
 
+    app.ready = true;
+
     // Load the initial starting screen scene (must be after pipelines are created
-    // since changeScene parents objects to them)
+    // since changeScene registers objects with them)
     app_mod.call(.changeScene);
+}
+
+/// Registers an object with a gfx.Sprite, gfx.Text, or Card pipeline's render list.
+fn addToRenderList(module: anytype, allocator: std.mem.Allocator, pipeline_id: mach.ObjectID, object_id: mach.ObjectID) !void {
+    var render_list = module.pipelines.get(pipeline_id, .render_list);
+    try render_list.append(allocator, object_id);
+    module.pipelines.set(pipeline_id, .render_list, render_list);
+}
+
+/// Plays a decoded sound effect, by copying its samples into a new mach.Audio buffer (which
+/// mach.Audio.cleanup frees once the buffer is deleted.)
+fn playSfx(app: *App, audio: *mach.Audio, sfx: mach.Audio.Opus, volume: f32, scene_tag: ?Scene) !void {
+    const samples = try audio.allocSamples(sfx.samples.len);
+    @memcpy(samples, sfx.samples);
+
+    audio.buffers.lock();
+    defer audio.buffers.unlock();
+    const sfx_entity = try audio.buffers.new(.{
+        .samples = samples,
+        .channels = sfx.channels,
+        .playing = true,
+        .volume = volume,
+    });
+    try audio.buffers.setTag(sfx_entity, App, .is_sfx, null);
+    if (scene_tag) |scene| try setSceneTag(audio, sfx_entity, scene);
+    _ = app;
+}
+
+/// Decodes and plays looping background music for the given scene.
+fn playBgm(audio: *mach.Audio, opus_data: []const u8, scene: Scene) !void {
+    // Decode using the audio allocator, since mach.Audio.cleanup frees the samples.
+    const bgm = try mach.Audio.Opus.decodeStream(audio.allocator, .{ .data = opus_data });
+
+    audio.buffers.lock();
+    defer audio.buffers.unlock();
+    const bgm_entity = try audio.buffers.new(.{
+        .samples = bgm.samples,
+        .channels = bgm.channels,
+        .playing = true,
+    });
+    try setSceneTag(audio, bgm_entity, scene);
+    try audio.buffers.setTag(bgm_entity, App, .is_bgm, null);
+}
+
+fn setSceneTag(audio: *mach.Audio, buffer_id: mach.ObjectID, scene: Scene) !void {
+    switch (scene) {
+        .none => {},
+        .start => try audio.buffers.setTag(buffer_id, App, .is_start_scene, null),
+        .game => try audio.buffers.setTag(buffer_id, App, .is_game_scene, null),
+    }
+}
+
+/// Frees app sprites that were deleted (either directly, or by cascade when their parent
+/// gfx.Sprite was deleted.)
+pub fn cleanupSprites(app: *App) void {
+    var deleted = app.sprites.sliceDeleted();
+    while (deleted.next()) |id| app.sprites.free(id);
+}
+
+/// Copies the app state the render thread needs. Runs while the app thread holds the render
+/// snapshot lock, so the render thread is not reading render_state concurrently.
+pub fn snapshot(app: *App) void {
+    if (!app.ready) return;
+    app.render_state = .{
+        .ready = true,
+        .scene = app.scene,
+        .sprite_pipeline_id = app.sprite_pipeline_id,
+        .text_pipeline_id = app.text_pipeline_id,
+        .rtt_card_pipeline_id = app.rtt_card_pipeline_id,
+        .cloud_card_pipeline_id = app.cloud_card_pipeline_id,
+    };
 }
 
 /// Called on the high-priority audio OS thread when the audio driver needs more audio samples, so
 /// this callback should be fast to respond.
-pub fn audioStateChange(audio: *mach.Audio, app: *App) !void {
+pub fn audioStateChange(audio: *mach.Audio) !void {
     audio.buffers.lock();
     defer audio.buffers.unlock();
 
@@ -314,10 +499,8 @@ pub fn audioStateChange(audio: *mach.Audio, app: *App) !void {
             audio.buffers.set(buf_id, .index, 0);
             audio.buffers.set(buf_id, .playing, true);
         } else {
-            // Remove the audio buffer that is no longer playing
-            const samples = audio.buffers.get(buf_id, .samples);
+            // Remove the audio buffer that is no longer playing (mach.Audio.cleanup frees it.)
             audio.buffers.delete(buf_id);
-            app.allocator.free(samples);
         }
     }
 }
@@ -338,7 +521,6 @@ fn clearCurrentScene(
             var sprite_iter = sprite.objects.slice();
             while (sprite_iter.next()) |id| {
                 if (sprite.objects.hasTag(id, App, .is_start_scene)) {
-                    sprite.pipelines.removeChild(app.sprite_pipeline_id, id) catch {};
                     sprite.objects.delete(id);
                 }
             }
@@ -346,24 +528,13 @@ fn clearCurrentScene(
             var text_iter = text.objects.slice();
             while (text_iter.next()) |id| {
                 if (text.objects.hasTag(id, App, .is_start_scene)) {
-                    text.pipelines.removeChild(app.text_pipeline_id, id) catch {};
                     text.objects.delete(id);
                 }
-            }
-            // Free allocated text resources
-            if (app.text_content) |content| {
-                app.allocator.free(content);
-                app.text_content = null;
-            }
-            if (app.text_segments) |segments| {
-                app.allocator.free(segments);
-                app.text_segments = null;
             }
             // Remove start scene card objects (cloud cards)
             var card_iter = card.objects.slice();
             while (card_iter.next()) |id| {
                 if (card.objects.hasTag(id, App, .is_start_scene)) {
-                    card.pipelines.removeChild(app.cloud_card_pipeline_id, id) catch {};
                     card.objects.delete(id);
                 }
             }
@@ -373,11 +544,7 @@ fn clearCurrentScene(
                 defer audio.buffers.unlock();
                 var buf_iter = audio.buffers.slice();
                 while (buf_iter.next()) |id| {
-                    if (audio.buffers.hasTag(id, App, .is_start_scene)) {
-                        const samples = audio.buffers.get(id, .samples);
-                        audio.buffers.delete(id);
-                        app.allocator.free(samples);
-                    }
+                    if (audio.buffers.hasTag(id, App, .is_start_scene)) audio.buffers.delete(id);
                 }
             }
             // Remove start scene app sprites
@@ -393,7 +560,6 @@ fn clearCurrentScene(
             var sprite_iter = sprite.objects.slice();
             while (sprite_iter.next()) |id| {
                 if (sprite.objects.hasTag(id, App, .is_game_scene)) {
-                    sprite.pipelines.removeChild(app.sprite_pipeline_id, id) catch {};
                     sprite.objects.delete(id);
                 }
             }
@@ -401,7 +567,6 @@ fn clearCurrentScene(
             var card_iter = card.objects.slice();
             while (card_iter.next()) |id| {
                 if (card.objects.hasTag(id, App, .is_game_scene)) {
-                    card.pipelines.removeChild(app.cloud_card_pipeline_id, id) catch {};
                     card.objects.delete(id);
                 }
             }
@@ -411,11 +576,7 @@ fn clearCurrentScene(
                 defer audio.buffers.unlock();
                 var buf_iter = audio.buffers.slice();
                 while (buf_iter.next()) |id| {
-                    if (audio.buffers.hasTag(id, App, .is_game_scene)) {
-                        const samples = audio.buffers.get(id, .samples);
-                        audio.buffers.delete(id);
-                        app.allocator.free(samples);
-                    }
+                    if (audio.buffers.hasTag(id, App, .is_game_scene)) audio.buffers.delete(id);
                 }
             }
             // Remove game scene app sprites
@@ -450,18 +611,7 @@ pub fn changeScene(
         .none => {},
         .start => {
             // Load our "prelude" background music
-            const bgm_fbs = std.io.fixedBufferStream(assets.bgm.prelude);
-            const bgm_sound_stream = std.io.StreamSource{ .const_buffer = bgm_fbs };
-            const bgm = try mach.Audio.Opus.decodeStream(app.allocator, bgm_sound_stream);
-
-            // Create an audio entity to play our background music
-            const bgm_entity = try audio.buffers.new(.{
-                .samples = bgm.samples,
-                .channels = bgm.channels,
-                .playing = true,
-            });
-            try audio.buffers.setTag(bgm_entity, App, .is_start_scene, null);
-            try audio.buffers.setTag(bgm_entity, App, .is_bgm, null);
+            try playBgm(audio, assets.bgm.prelude, .start);
 
             // Create text style
             const text_style_id = try text.styles.new(.{
@@ -470,20 +620,11 @@ pub fn changeScene(
                 // .color = vec4(0.604, 0.584, 0.525, 1.0),
             });
 
-            // Allocate the text segment in persistent memory
-            app.text_content = try app.allocator.dupe(u8, "Press any key to start");
-            app.text_segments = try app.allocator.alloc(gfx.Text.Segment, 1);
-            app.text_segments.?[0] = .{
-                .text = app.text_content.?,
-                .style = text_style_id,
-            };
-
-            // Create the text object with allocated segments
-            const text_id = try text.objects.new(.{
-                .transform = Mat4x4.translate(vec3(-100, -360, 0)),
-                .segments = app.text_segments.?,
+            // Create the text object (its memory is managed by gfx.Text)
+            const text_id = try text.createFmt(Mat4x4.translate(vec3(-100, -360, 0)), .{
+                .{ text_style_id, "Press any key to start", .{} },
             });
-            try text.pipelines.setParent(text_id, app.text_pipeline_id);
+            try addToRenderList(text, app.allocator, app.text_pipeline_id, text_id);
             try text.objects.setTag(text_id, App, .is_start_scene, null);
 
             // Create the "Lord of Zero" logo sprite
@@ -505,7 +646,7 @@ pub fn changeScene(
                         .size = undefined,
                         .uv_transform = undefined,
                     });
-                    try sprite.pipelines.setParent(logo_sprite, app.sprite_pipeline_id);
+                    try addToRenderList(sprite, app.allocator, app.sprite_pipeline_id, logo_sprite);
                     try sprite.objects.setTag(logo_sprite, App, .is_logo, null);
                     const app_sprite = try app.sprites.new(.{ .name = sprite_info.name });
                     try app.sprites.setParent(app_sprite, logo_sprite);
@@ -527,26 +668,15 @@ pub fn changeScene(
                     .uv_transform = Mat3x3.translate(vec2(0, 0)),
                     .size = vec2(1920, 1080),
                 });
-                try card.pipelines.setParent(bg_card, app.cloud_card_pipeline_id);
+                try addToRenderList(card, app.allocator, app.cloud_card_pipeline_id, bg_card);
                 try card.objects.setTag(bg_card, App, .is_start_scene, null);
                 // Explicitly mark a field as updated so Card.tick refreshes pipeline buffers
                 card.objects.set(bg_card, .size, vec2(1920, 1080));
             }
         },
         .game => {
-            // Load our "Morning Breaks" background music
-            const bgm_fbs = std.io.fixedBufferStream(assets.bgm.night_falls);
-            const bgm_sound_stream = std.io.StreamSource{ .const_buffer = bgm_fbs };
-            const bgm = try mach.Audio.Opus.decodeStream(app.allocator, bgm_sound_stream);
-
-            // Create an audio entity to play our background music
-            const bgm_entity = try audio.buffers.new(.{
-                .samples = bgm.samples,
-                .channels = bgm.channels,
-                .playing = true,
-            });
-            try audio.buffers.setTag(bgm_entity, App, .is_game_scene, null);
-            try audio.buffers.setTag(bgm_entity, App, .is_bgm, null);
+            // Load our "Night Falls" background music
+            try playBgm(audio, assets.bgm.night_falls, .game);
 
             // Find the LDTK level "Level_0"
             const level = blk: {
@@ -590,7 +720,7 @@ pub fn changeScene(
                     .size = undefined,
                     .uv_transform = undefined,
                 });
-                try sprite.pipelines.setParent(app.player_id, app.sprite_pipeline_id);
+                try addToRenderList(sprite, app.allocator, app.sprite_pipeline_id, app.player_id);
                 try SpriteCalc.apply(sprite, app.player_id, .{
                     .sprite_info = sprite_info,
                     .pos = app.player_position,
@@ -646,7 +776,7 @@ pub fn changeScene(
                         .uv_transform = Mat3x3.translate(vec2(0, 0)),
                         .size = vec2(layer_width * world_scale, layer_height * world_scale),
                     });
-                    try card.pipelines.setParent(bg_card, app.cloud_card_pipeline_id);
+                    try addToRenderList(card, app.allocator, app.cloud_card_pipeline_id, bg_card);
                     try card.objects.setTag(bg_card, App, .is_game_scene, null);
                     // Explicitly mark a field as updated so Card.tick refreshes pipeline buffers
                     card.objects.set(bg_card, .size, vec2(layer_width * world_scale, layer_height * world_scale));
@@ -672,7 +802,7 @@ pub fn changeScene(
                                 .size = undefined,
                                 .uv_transform = undefined,
                             });
-                            try sprite.pipelines.setParent(tile_sprite, app.sprite_pipeline_id);
+                            try addToRenderList(sprite, app.allocator, app.sprite_pipeline_id, tile_sprite);
                             try SpriteCalc.apply(sprite, tile_sprite, .{
                                 .sprite_info = sprite_info,
                                 .pos = pos,
@@ -753,7 +883,7 @@ pub fn changeScene(
                                 .size = undefined,
                                 .uv_transform = undefined,
                             });
-                            try sprite.pipelines.setParent(entity_sprite, app.sprite_pipeline_id);
+                            try addToRenderList(sprite, app.allocator, app.sprite_pipeline_id, entity_sprite);
                             try SpriteCalc.apply(sprite, entity_sprite, .{
                                 .sprite_info = sprite_info,
                                 .pos = pos,
@@ -793,6 +923,7 @@ pub fn updateAnims(
     app: *App,
     audio: *mach.Audio,
 ) !void {
+    if (!app.ready) return;
     const atlas = app.parsed_atlas.value;
 
     var sprites_iter = app.sprites.slice();
@@ -813,7 +944,6 @@ pub fn updateAnims(
             const gfx_sprite_id = (app.sprites.getParent(app_sprite_id) catch null) orelse continue;
 
             if (app.sprites.hasTag(app_sprite_id, App, .delete_after_anim)) {
-                try sprite.pipelines.removeChild(app.sprite_pipeline_id, gfx_sprite_id);
                 sprite.objects.delete(gfx_sprite_id);
                 app.sprites.delete(app_sprite_id);
                 continue;
@@ -826,17 +956,7 @@ pub fn updateAnims(
                 const dist = player_pos.dist(&sound_pos);
                 const spatial_volume = 0.2 * (1.0 - @min(@as(f32, 1.0), dist / 1500.0));
 
-                const sfx_fbs = std.io.fixedBufferStream(assets.sfx.grimble);
-                const sfx_sound_stream = std.io.StreamSource{ .const_buffer = sfx_fbs };
-                const sfx = try mach.Audio.Opus.decodeStream(app.allocator, sfx_sound_stream);
-                const sfx_entity = try audio.buffers.new(.{
-                    .samples = sfx.samples,
-                    .channels = sfx.channels,
-                    .playing = true,
-                    .volume = spatial_volume,
-                });
-                try audio.buffers.setTag(sfx_entity, App, .is_game_scene, null);
-                try audio.buffers.setTag(sfx_entity, App, .is_sfx, null);
+                try app.playSfx(audio, app.sfx_grimble, spatial_volume, .game);
             }
         }
 
@@ -858,6 +978,7 @@ pub fn updateSfx(
     sprite: *gfx.Sprite,
     app: *App,
 ) !void {
+    if (!app.ready) return;
     // Update grimble positions — grimbles face and move toward the player
     const atlas = app.parsed_atlas.value;
     var sprites_iter = app.sprites.slice();
@@ -904,7 +1025,8 @@ pub fn pollInput(
     var direction = app.direction;
     var player_wants_to_attack = app.player_wants_to_attack;
     var player_wants_to_run = app.player_wants_to_run;
-    while (core.nextEvent()) |event| {
+    var iter = core.events(.default);
+    while (iter.next()) |event| {
         switch (event) {
             .key_press => |ev| {
                 switch (ev.key) {
@@ -916,24 +1038,13 @@ pub fn pollInput(
                     .left_shift => player_wants_to_run = true,
                     else => {},
                 }
-                if (app.scene == .start and app.pending_scene == null) {
-                    // Load our "Morning bells" sfx
-                    const sfx_fbs = std.io.fixedBufferStream(assets.sfx.morning_bells);
-                    const sfx_sound_stream = std.io.StreamSource{ .const_buffer = sfx_fbs };
-                    const sfx = try mach.Audio.Opus.decodeStream(app.allocator, sfx_sound_stream);
-
-                    // Create an audio entity to play our sfx
-                    const sfx_entity = try audio.buffers.new(.{
-                        .samples = sfx.samples,
-                        .channels = sfx.channels,
-                        .playing = true,
-                        .volume = 1.0,
-                    });
-                    try audio.buffers.setTag(sfx_entity, App, .is_sfx, null);
+                if (app.ready and app.scene == .start and app.pending_scene == null) {
+                    // Play our "Morning bells" sfx
+                    try app.playSfx(audio, app.sfx_morning_bells, 1.0, null);
 
                     // Schedule scene change after the sfx finishes playing
                     app.pending_scene = .game;
-                    app.pending_scene_timer = try time.Timer.start();
+                    app.pending_scene_timer = time.Timer.start(app.io);
                 }
             },
             .key_release => |ev| {
@@ -947,10 +1058,14 @@ pub fn pollInput(
                     else => {},
                 }
             },
-            .window_open => |ev| try setupPipeline(core, app, app_mod, sprite, card, text, ev.window_id),
             .close => core.exit(),
             else => {},
         }
+    }
+
+    // Once the render thread has created our GPU resources, create our pipelines and scene.
+    if (!app.ready and app.gpu_ready.load(.acquire)) {
+        try setupPipelines(app, app_mod, sprite, card, text);
     }
     app.last_direction = app.direction;
     app.direction = direction;
@@ -966,6 +1081,7 @@ pub fn updateScene(
     app: *App,
     app_mod: mach.Mod(App),
 ) !void {
+    if (!app.ready) return;
     // Check if a pending scene change is ready (e.g. waiting for sfx to finish)
     if (app.pending_scene) |next_scene| {
         if (app.pending_scene_timer.read() >= 2.0) {
@@ -988,9 +1104,8 @@ pub fn updateSceneStart(
 ) !void {
     // Make the logo sprites (there are multiple, one for each 'sprite layer' in pixi) bounce up and down slowly
     const atlas = app.parsed_atlas.value;
-    var pipeline_children = try sprite.pipelines.getChildren(app.sprite_pipeline_id);
-    defer pipeline_children.deinit();
-    for (pipeline_children.items) |sprite_id| {
+    for (sprite.pipelines.get(app.sprite_pipeline_id, .render_list).items) |sprite_id| {
+        if (!sprite.objects.is(sprite_id) or sprite.objects.isDeleted(sprite_id)) continue;
         if (!sprite.objects.hasTag(sprite_id, App, .is_logo)) continue;
         const sprite_info = pixiSpriteInfo(app, atlas, sprite_id) orelse continue;
 
@@ -1092,7 +1207,7 @@ pub fn updateSceneGame(
             .size = undefined,
             .uv_transform = undefined,
         });
-        try sprite.pipelines.setParent(attack_fx, app.sprite_pipeline_id);
+        try addToRenderList(sprite, app.allocator, app.sprite_pipeline_id, attack_fx);
         try SpriteCalc.apply(sprite, attack_fx, .{
             .sprite_info = sprite_info,
             .pos = position,
@@ -1120,40 +1235,14 @@ pub fn updateSceneGame(
         if (!app.is_attacking and !dir.eql(&vec2(0, 0)) and
             ((app.player_wants_to_run and i % 1 == 0) or (!app.player_wants_to_run and i % 2 == 0)))
         {
-            // Load our "footsteps" sfx
-            // TODO: load sound effects somewhere and store them, so that we don't decode on every footstep :)
-            const sfx_fbs = std.io.fixedBufferStream(assets.sfx.footsteps);
-            const sfx_sound_stream = std.io.StreamSource{ .const_buffer = sfx_fbs };
-            const sfx = try mach.Audio.Opus.decodeStream(app.allocator, sfx_sound_stream);
-
-            // Create an audio buffer to play our sfx
-            const sfx_entity = try audio.buffers.new(.{
-                .samples = sfx.samples,
-                .channels = sfx.channels,
-                .playing = true,
-                .volume = 3.3,
-            });
-            try audio.buffers.setTag(sfx_entity, App, .is_game_scene, null);
-            try audio.buffers.setTag(sfx_entity, App, .is_sfx, null);
+            // Play our "footsteps" sfx
+            try app.playSfx(audio, app.sfx_footsteps, 3.3, .game);
         }
 
         // If attacking, play attack noise on first frame
         if (app.is_attacking and i == 0) {
-            // Load our "freeze" sfx
-            // TODO: load sound effects somewhere and store them, so that we don't decode on every footstep :)
-            const sfx_fbs = std.io.fixedBufferStream(assets.sfx.freeze);
-            const sfx_sound_stream = std.io.StreamSource{ .const_buffer = sfx_fbs };
-            const sfx = try mach.Audio.Opus.decodeStream(app.allocator, sfx_sound_stream);
-
-            // Create an audio buffer to play our sfx
-            const sfx_entity = try audio.buffers.new(.{
-                .samples = sfx.samples,
-                .channels = sfx.channels,
-                .playing = true,
-                .volume = 0.6,
-            });
-            try audio.buffers.setTag(sfx_entity, App, .is_game_scene, null);
-            try audio.buffers.setTag(sfx_entity, App, .is_sfx, null);
+            // Play our "freeze" sfx
+            try app.playSfx(audio, app.sfx_freeze, 0.6, .game);
         }
     }
 }
@@ -1165,36 +1254,39 @@ pub fn updateCamera(
     app: *App,
     card: *Card,
 ) !void {
+    if (!app.ready) return;
+
     // Our aim will be for our virtual canvas to be two thirds 1920x1080px. For our game, we do not
     // want the player to see more or less horizontally, as that may give an unfair advantage, but
     // they can see more or less vertically as that will only be more clouds or ground texture. As
     // such, we make the width fixed and dynamically adjust the height of our virtual canvas to be
     // whatever is needed to match the actual window aspect ratio without any stretching.
-    const window_width_px: f32 = @floatFromInt(core.windows.get(app.window_id, .width));
-    const window_height_px: f32 = @floatFromInt(core.windows.get(app.window_id, .height));
+    const window_width_px: f32, const window_height_px: f32 = blk: {
+        core.windows.lockShared();
+        defer core.windows.unlockShared();
+        break :blk .{
+            @floatFromInt(core.windows.get(app.window_id, .width)),
+            @floatFromInt(core.windows.get(app.window_id, .height)),
+        };
+    };
     const width_px: f32 = 1920.0 * (3.0 / 4.0);
     const height_px: f32 = width_px * (window_height_px / window_width_px);
 
-    // Recreate RTT texture if the framebuffer size changed.
-    // Note: we do NOT release the old texture_view here — the card pipeline's rebuildPipeline
-    // will release it via built.deinit() when it rebuilds with the new texture_view.
-    const fb_width: u32 = core.windows.get(app.window_id, .framebuffer_width);
-    const fb_height: u32 = core.windows.get(app.window_id, .framebuffer_height);
-    if (fb_width != app.rtt_width or fb_height != app.rtt_height) {
-        app.rtt_width = fb_width;
-        app.rtt_height = fb_height;
-        const device = core.windows.get(app.window_id, .device);
-        const rtt_texture = device.createTexture(&gpu.Texture.Descriptor.init(.{
-            .size = .{ .width = fb_width, .height = fb_height },
-            .format = .bgra8_unorm,
-            .usage = .{ .texture_binding = true, .copy_dst = true, .render_attachment = true },
-        }));
-        app.rtt_texture_view = rtt_texture.createView(null);
-        rtt_texture.release(); // view retains the texture
-        card.pipelines.set(app.rtt_card_pipeline_id, .texture_view, app.rtt_texture_view);
-        card.pipelines.set(app.rtt_card_pipeline_id, .texture_view_size, vec2(@floatFromInt(fb_width), @floatFromInt(fb_height)));
-        card.objects.set(app.rtt_card_id, .size, vec2(@floatFromInt(fb_width), @floatFromInt(fb_height)));
+    // If the render thread recreated the RTT texture (framebuffer resized), point the RTT card at
+    // the new texture. The card pipeline holds its own reference to the old view until it rebuilds.
+    {
+        app.pending_rtt_mu.lockUncancelable(app.io);
+        defer app.pending_rtt_mu.unlock(app.io);
+        if (app.pending_rtt) |rtt| {
+            app.pending_rtt = null;
+            const size = vec2(@floatFromInt(rtt.width), @floatFromInt(rtt.height));
+            card.pipelines.set(app.rtt_card_pipeline_id, .texture_view, rtt.view);
+            card.pipelines.set(app.rtt_card_pipeline_id, .texture_view_size, size);
+            card.objects.set(app.rtt_card_id, .size, size);
+            rtt.view.release(); // our hand-off reference; the pipeline references it on rebuild
+        }
     }
+    const rtt_size = card.pipelines.get(app.rtt_card_pipeline_id, .texture_view_size);
     const projection = math.Mat4x4.projection2D(.{
         .left = -width_px / 2,
         .right = width_px / 2,
@@ -1227,12 +1319,13 @@ pub fn updateCamera(
     // Cloud cards use the same camera view_projection as sprites (they're in world space)
     card.pipelines.set(app.cloud_card_pipeline_id, .view_projection, view_projection);
     card.pipelines.set(app.cloud_card_pipeline_id, .time, app.world_time);
+    card.pipelines.set(app.rtt_card_pipeline_id, .time, app.world_time);
 
     // The RTT card uses projection only (no camera view) since it's a fullscreen quad.
     // We scale the card from framebuffer pixels to virtual canvas pixels, and position it
     // to fill the screen (centered at origin).
-    const scale_x = width_px / @as(f32, @floatFromInt(fb_width));
-    const scale_y = height_px / @as(f32, @floatFromInt(fb_height));
+    const scale_x = width_px / rtt_size.x();
+    const scale_y = height_px / rtt_size.y();
     card.pipelines.set(app.rtt_card_pipeline_id, .view_projection, projection);
     card.objects.set(app.rtt_card_id, .transform, Mat4x4.translate(vec3(
         -width_px / 2,
@@ -1263,6 +1356,8 @@ pub fn updateCamera(
     }
 }
 
+/// Called on the render thread. Reads only the render snapshot (app.render_state and the
+/// render-side copies of gfx/card objects), never live app state.
 pub fn renderFrame(
     core: *mach.Core,
     sprite: *gfx.Sprite,
@@ -1274,7 +1369,35 @@ pub fn renderFrame(
     app: *App,
 ) !void {
     const label = @tagName(mach_module) ++ ".renderFrame";
-    const window = core.windows.getValue(app.window_id);
+    const window = core.windows.getValue(core.window);
+
+    // GPU resources are created here on the render thread; the app thread then sets up pipelines.
+    if (!app.gpu_ready.load(.acquire)) {
+        try app.setupGpu(window);
+        return;
+    }
+    const rs = app.render_state;
+    if (!rs.ready) return;
+
+    // Recreate the RTT texture if the framebuffer size changed, and hand it to the app thread
+    // so it can update the RTT card pipeline.
+    if (window.framebuffer_width != app.gpu_res.rtt_width or window.framebuffer_height != app.gpu_res.rtt_height) {
+        app.gpu_res.rtt_view.release();
+        app.gpu_res.rtt_view = createRttView(window.device, window.framebuffer_width, window.framebuffer_height);
+        app.gpu_res.rtt_width = window.framebuffer_width;
+        app.gpu_res.rtt_height = window.framebuffer_height;
+
+        app.pending_rtt_mu.lockUncancelable(app.io);
+        defer app.pending_rtt_mu.unlock(app.io);
+        if (app.pending_rtt) |stale| stale.view.release();
+        app.gpu_res.rtt_view.reference(); // hand-off reference, released by the app thread
+        app.pending_rtt = .{
+            .view = app.gpu_res.rtt_view,
+            .width = app.gpu_res.rtt_width,
+            .height = app.gpu_res.rtt_height,
+        };
+    }
+
     const encoder = window.device.createCommandEncoder(&.{ .label = label });
     defer encoder.release();
 
@@ -1291,8 +1414,8 @@ pub fn renderFrame(
 
         // Begin a render pass that will render our scene to a texture (rtt == render to texture)
         const rtt_color_attachments = [_]gpu.RenderPassColorAttachment{.{
-            .view = app.rtt_texture_view,
-            .clear_value = switch (app.scene) {
+            .view = app.gpu_res.rtt_view,
+            .clear_value = switch (rs.scene) {
                 .none => dark_gray,
                 .start => dark_gray,
                 .game => dark_gray,
@@ -1306,14 +1429,14 @@ pub fn renderFrame(
         }));
 
         // Render sprites
-        sprite.pipelines.set(app.sprite_pipeline_id, .render_pass, render_pass);
-        sprite_mod.call(.tick);
+        sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, render_pass);
+        sprite_mod.call(.render);
 
         // Render cloud/fog cards (on top of sprites, in world space)
         // Only the cloud pipeline should render here — ensure the RTT pipeline is disabled.
-        card.pipelines.set(app.rtt_card_pipeline_id, .render_pass, @as(?*gpu.RenderPassEncoder, null));
-        card.pipelines.set(app.cloud_card_pipeline_id, .render_pass, render_pass);
-        card_mod.call(.tick);
+        card.pipelines.setRaw(rs.rtt_card_pipeline_id, .render_pass, null);
+        card.pipelines.setRaw(rs.cloud_card_pipeline_id, .render_pass, render_pass);
+        card_mod.call(.render);
 
         // Finish render pass
         render_pass.end();
@@ -1337,34 +1460,36 @@ pub fn renderFrame(
 
         // Render the RTT card (post-processing: water reflections)
         // Only the RTT pipeline should render here — ensure the cloud pipeline is disabled.
-        card.pipelines.set(app.cloud_card_pipeline_id, .render_pass, @as(?*gpu.RenderPassEncoder, null));
-        card.pipelines.set(app.rtt_card_pipeline_id, .render_pass, render_pass);
-        card.pipelines.set(app.rtt_card_pipeline_id, .time, app.world_time);
-        card_mod.call(.tick);
+        card.pipelines.setRaw(rs.cloud_card_pipeline_id, .render_pass, null);
+        card.pipelines.setRaw(rs.rtt_card_pipeline_id, .render_pass, render_pass);
+        card_mod.call(.render);
 
         // Render text on top of everything (so it's not affected by water reflections)
-        text.pipelines.set(app.text_pipeline_id, .render_pass, render_pass);
-        text_mod.call(.tick);
+        text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, render_pass);
+        text_mod.call(.render);
 
         // Finish render pass
         render_pass.end();
         render_pass.release();
     }
 
+    // Clear the transient render pass pointers, since the passes have been released.
+    sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, null);
+    card.pipelines.setRaw(rs.rtt_card_pipeline_id, .render_pass, null);
+    text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, null);
+
     // Finish the frame
+    var command = encoder.finish(&.{ .label = label });
+    window.queue.submit(&[_]*gpu.CommandBuffer{command});
+    command.release();
+
+    // Update the window title with the frame rate
     {
-        var command = encoder.finish(&.{ .label = label });
-        window.queue.submit(&[_]*gpu.CommandBuffer{command});
-        command.release();
-
-        app.frame_count += 1;
-
-        // Every second, update the window title with the FPS
-        if (app.fps_timer.read() >= 1.0) {
-            app.fps_timer.reset();
-            app.fps = app.frame_count;
-            app.frame_count = 0;
-        }
+        core.windows.lock();
+        defer core.windows.unlock();
+        try core.fmtTitle(app.window_id, "Lord of Zero [ {d}fps ] [ Input {d}hz ]", .{
+            core.frame.rate, core.input.rate,
+        });
     }
 }
 
@@ -1372,7 +1497,7 @@ pub fn renderFrame(
 fn loadTexture(device: *gpu.Device, queue: *gpu.Queue, allocator: std.mem.Allocator, png_bytes: []const u8) !*gpu.Texture {
     // Load the image from memory
     var img = try zigimg.Image.fromMemory(allocator, png_bytes);
-    defer img.deinit();
+    defer img.deinit(allocator);
     const img_size = gpu.Extent3D{ .width = @as(u32, @intCast(img.width)), .height = @as(u32, @intCast(img.height)) };
 
     // Create a GPU texture

@@ -1,15 +1,17 @@
 .{
-    .name = "lordofzero",
+    .name = .lordofzero,
+    .fingerprint = 0x5f4d2d0a864dfd4c, // Changing this has security and trust implications.
     .version = "1.0.0",
-    .mach_zig_version = "2024.11.0-mach",
+    .mach_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .mach = .{
-            .url = "https://pkg.hexops.org/pkg/hexops/mach/bf330f9b5c08829902d8ac8e88008d02a752c994.tar.gz",
-            .hash = "1220bc27152e825fe70166da1f1292f82a639ca5770d6f505aea7b886cfd5f5d0f48",
+            .url = "git+https://github.com/gaarutyunov/mach#3895909ee5855082463f58f4d498225fba944a25",
+            .hash = "mach-0.5.0-jXwHfRTuNAAmtJXkqkYgCu2yLX5vaOQkfamXCODSPjLm",
         },
         .zigimg = .{
-            .url = "https://github.com/zigimg/zigimg/archive/48bfe6d413a5b3723a7bcf36f1fabbba30efef68.tar.gz",
-            .hash = "12201b874ac217853e59f55477b96cb7a66d43a5930ed9b4f0cfc7113efc8f5a6449",
+            .url = "git+https://github.com/zigimg/zigimg#083d0304840a3f5fd547c2e2005148a18886c401",
+            .hash = "zigimg-0.1.0-8_eo2j1pGAA3ArMKhXcipNR-tdjmeWmByLJhOff2A_X4",
         },
     },
     .paths = .{
