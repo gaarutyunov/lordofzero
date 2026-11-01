@@ -7,7 +7,6 @@ const math = mach.math;
 const time = mach.time;
 const assets = @import("assets");
 
-const Card = @import("Card.zig");
 const pixi = @import("pixi.zig");
 const ldtk = @import("ldtk.zig");
 
@@ -63,7 +62,6 @@ pub const main = mach.schedule(.{
     .{ mach.Audio, .init },
     .{ gfx.Sprite, .init },
     .{ gfx.Text, .init },
-    .{ Card, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
@@ -95,7 +93,6 @@ pub const cleanup = mach.schedule(.{
     .{ App, .cleanupSprites },
     .{ gfx.Sprite, .cleanup },
     .{ gfx.Text, .cleanup },
-    .{ Card, .cleanup },
     .{ mach.Audio, .cleanup },
 });
 
@@ -104,7 +101,6 @@ pub const snapshotFrame = mach.schedule(.{
     .{ mach.Core, .snapshotStart },
     .{ gfx.Sprite, .snapshot },
     .{ gfx.Text, .snapshot },
-    .{ Card, .snapshot },
     .{ App, .snapshot },
     .{ mach.Core, .snapshotEnd },
 });
@@ -158,13 +154,13 @@ sfx_grimble: mach.Audio.Opus,
 ready: bool = false,
 
 /// GPU resources created by the render thread, see setupGpu. Once `gpu_ready` is set (by the
-/// render thread), the app thread may read `gpu_res`. `gpu_res.rtt_view` is only ever replaced by the
-/// render thread, and is handed to the app thread via `pending_rtt`.
+/// render thread), the app thread may read `gpu_res`. `gpu_res.rtt_texture`/`rtt_view` are only ever
+/// replaced by the render thread, and the texture is handed to the app thread via `pending_rtt`.
 gpu_res: Gpu = undefined,
 gpu_ready: std.atomic.Value(bool) = .init(false),
 
-/// A newly (re)created render-to-texture view, created by the render thread on resize and handed
-/// over to the app thread so that it can update the RTT card pipeline. Guarded by pending_rtt_mu.
+/// A newly (re)created render-to-texture texture, created by the render thread on resize and handed
+/// over to the app thread so that it can update the RTT sprite pipeline. Guarded by pending_rtt_mu.
 pending_rtt: ?PendingRtt = null,
 pending_rtt_mu: std.Io.Mutex = .init,
 
@@ -188,9 +184,11 @@ sprites: mach.Objects(.{}, struct {
     position: Vec3 = vec3(0, 0, 0),
     parallax: ?[2]f32 = null,
 }),
-rtt_card_pipeline_id: mach.ObjectID = undefined,
-rtt_card_id: mach.ObjectID = undefined,
-cloud_card_pipeline_id: mach.ObjectID = undefined,
+rtt_pipeline_id: mach.ObjectID = undefined,
+rtt_sprite_id: mach.ObjectID = undefined,
+/// Size of the RTT texture currently bound to the RTT pipeline, in framebuffer pixels.
+rtt_size: Vec2 = vec2(1, 1),
+cloud_pipeline_id: mach.ObjectID = undefined,
 sprite_pipeline_id: mach.ObjectID = undefined,
 text_pipeline_id: mach.ObjectID = undefined,
 parsed_atlas: pixi.ParsedAtlas = undefined,
@@ -198,22 +196,33 @@ parsed_level: ldtk.ParsedFile = undefined,
 parsed_ldtk_compatibility: pixi.ParsedLDTKCompatibility = undefined,
 
 const Gpu = struct {
-    /// Sprite atlas texture.
+    /// Sprite atlas texture. Also bound to the cloud pipeline, whose shader does not sample it but
+    /// whose UV scale is derived from its dimensions.
     atlas_texture: *gpu.Texture,
-    /// View of the sprite atlas, used by the cloud cards only for its dimensions.
-    cloud_view: *gpu.TextureView,
-    cloud_view_size: Vec2,
     pass1_shader: *gpu.ShaderModule,
+    clouds_shader: *gpu.ShaderModule,
+
+    /// Per-frame effect parameters (time) shared by the pass1 and clouds shaders at @group(1).
+    effect_uniforms: *gpu.Buffer,
+    effect_bind_group_layout: *gpu.BindGroupLayout,
+    effect_bind_group: *gpu.BindGroup,
 
     /// Render-to-texture target the scene is rendered into for post-processing. Owned by the
     /// render thread.
+    rtt_texture: *gpu.Texture,
     rtt_view: *gpu.TextureView,
     rtt_width: u32,
     rtt_height: u32,
 };
 
+/// Must match `Effect` in pass1.wgsl and clouds.wgsl.
+const EffectUniforms = extern struct {
+    /// x = world time in seconds; yzw unused.
+    params: gpu.Vec4 align(16),
+};
+
 const PendingRtt = struct {
-    view: *gpu.TextureView,
+    texture: *gpu.Texture,
     width: u32,
     height: u32,
 };
@@ -223,8 +232,9 @@ const RenderState = struct {
     scene: Scene = .none,
     sprite_pipeline_id: mach.ObjectID = undefined,
     text_pipeline_id: mach.ObjectID = undefined,
-    rtt_card_pipeline_id: mach.ObjectID = undefined,
-    cloud_card_pipeline_id: mach.ObjectID = undefined,
+    rtt_pipeline_id: mach.ObjectID = undefined,
+    cloud_pipeline_id: mach.ObjectID = undefined,
+    world_time: f32 = 0,
 };
 
 pub fn init(
@@ -293,11 +303,10 @@ pub fn deinit2(
     app: *App,
     audio: *mach.Audio,
     sprite: *gfx.Sprite,
-    card: *Card,
     text: *gfx.Text,
 ) void {
     // Clean up whatever scene is currently active
-    clearCurrentScene(app, audio, sprite, card, text);
+    clearCurrentScene(app, audio, sprite, text);
 
     app.allocator.free(app.sfx_morning_bells.samples);
     app.allocator.free(app.sfx_footsteps.samples);
@@ -307,7 +316,14 @@ pub fn deinit2(
     app.parsed_atlas.deinit();
     app.parsed_level.deinit();
     app.parsed_ldtk_compatibility.deinit();
-    if (app.gpu_ready.load(.acquire)) app.gpu_res.rtt_view.release();
+    if (app.gpu_ready.load(.acquire)) {
+        const g = app.gpu_res;
+        g.rtt_view.release();
+        g.rtt_texture.release();
+        g.effect_bind_group.release();
+        g.effect_bind_group_layout.release();
+        g.effect_uniforms.release();
+    }
 }
 
 /// Creates GPU resources. Called once on the render thread, since that is where all GPU work
@@ -316,33 +332,52 @@ fn setupGpu(app: *App, window: anytype) !void {
     // Create the texture we'll render our scene to for post-processing effects.
     // Sized to the window's framebuffer (actual pixel dimensions including DPI scaling).
     // Recreated on window resize in renderFrame.
-    const rtt_view = createRttView(window.device, window.framebuffer_width, window.framebuffer_height);
+    const rtt_texture = createRttTexture(window.device, window.framebuffer_width, window.framebuffer_height);
 
-    // The cloud card pipeline's texture_view is the sprite atlas — not sampled by the shader, but
-    // its dimensions (texture_view_size) determine the UV scale that the cloud function sees.
-    const cloud_texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png);
-    defer cloud_texture.release();
+    // Effect parameters for our custom sprite shaders, bound at @group(1) of their pipelines
+    // (gfx.Sprite owns @group(0)).
+    const device: *gpu.Device = window.device;
+    const effect_uniforms = device.createBuffer(&.{
+        .label = "effect uniforms",
+        .usage = .{ .uniform = true, .copy_dst = true },
+        .size = @sizeOf(EffectUniforms),
+        .mapped_at_creation = .false,
+    });
+    const effect_bind_group_layout = device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+        .label = "effect",
+        .entries = &.{
+            gpu.BindGroupLayout.Entry.initBuffer(0, .{ .fragment = true }, .uniform, false, 0),
+        },
+    }));
+    const effect_bind_group = device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .label = "effect",
+        .layout = effect_bind_group_layout,
+        .entries = &.{
+            gpu.BindGroup.Entry.initBuffer(0, effect_uniforms, 0, @sizeOf(EffectUniforms), @sizeOf(EffectUniforms)),
+        },
+    }));
 
     app.gpu_res = .{
         .atlas_texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png),
-        .cloud_view = cloud_texture.createView(null),
-        .cloud_view_size = vec2(@floatFromInt(cloud_texture.getWidth()), @floatFromInt(cloud_texture.getHeight())),
-        .pass1_shader = window.device.createShaderModuleWGSL("pass1.wgsl", @embedFile("pass1.wgsl")),
-        .rtt_view = rtt_view,
+        .pass1_shader = device.createShaderModuleWGSL("pass1.wgsl", @embedFile("pass1.wgsl")),
+        .clouds_shader = device.createShaderModuleWGSL("clouds.wgsl", @embedFile("clouds.wgsl")),
+        .effect_uniforms = effect_uniforms,
+        .effect_bind_group_layout = effect_bind_group_layout,
+        .effect_bind_group = effect_bind_group,
+        .rtt_texture = rtt_texture,
+        .rtt_view = rtt_texture.createView(null),
         .rtt_width = window.framebuffer_width,
         .rtt_height = window.framebuffer_height,
     };
     app.gpu_ready.store(true, .release);
 }
 
-fn createRttView(device: *gpu.Device, width: u32, height: u32) *gpu.TextureView {
-    const rtt_texture = device.createTexture(&gpu.Texture.Descriptor.init(.{
+fn createRttTexture(device: *gpu.Device, width: u32, height: u32) *gpu.Texture {
+    return device.createTexture(&gpu.Texture.Descriptor.init(.{
         .size = .{ .width = width, .height = height },
         .format = .bgra8_unorm,
         .usage = .{ .texture_binding = true, .copy_dst = true, .render_attachment = true },
     }));
-    defer rtt_texture.release(); // view retains the texture
-    return rtt_texture.createView(null);
 }
 
 /// Creates the render pipelines and loads the initial scene. Called on the app thread once the
@@ -351,35 +386,28 @@ fn setupPipelines(
     app: *App,
     app_mod: mach.Mod(App),
     sprite: *gfx.Sprite,
-    card: *Card,
     text: *gfx.Text,
 ) !void {
     const g = app.gpu_res;
 
-    // Create render-to-texture card with pass1.wgsl shader (water reflections + clouds/fog)
-    app.rtt_card_pipeline_id = try card.pipelines.new(.{
+    // Create a sprite rendering pipeline. Created first so it renders before (beneath) the
+    // cloud pipeline whenever both are active in the same render pass.
+    app.sprite_pipeline_id = try sprite.pipelines.new(.{
         .window = app.window_id,
-        .texture_view = g.rtt_view,
-        .texture_view_size = vec2(@floatFromInt(g.rtt_width), @floatFromInt(g.rtt_height)),
-        .blend_state = gpu.BlendState{},
-        .shader = g.pass1_shader,
+        .texture = g.atlas_texture,
     });
-    app.rtt_card_id = try card.objects.new(.{
-        .transform = Mat4x4.translate(vec3(0, 0, 0)),
-        .uv_transform = Mat3x3.translate(vec2(0, 0)),
-        .size = vec2(@floatFromInt(g.rtt_width), @floatFromInt(g.rtt_height)),
-    });
-    try addToRenderList(card, app.allocator, app.rtt_card_pipeline_id, app.rtt_card_id);
 
-    // Create cloud card pipeline (rendered in the RTT pass on top of sprites, using card.wgsl
-    // clouds-only shader).
-    app.cloud_card_pipeline_id = try card.pipelines.new(.{
+    // Create the cloud/fog pipeline (rendered in the RTT pass on top of sprites, using the
+    // clouds.wgsl shader). Time is passed to the shader via the @group(1) effect bind group.
+    app.cloud_pipeline_id = try sprite.pipelines.new(.{
         .window = app.window_id,
-        .texture_view = g.cloud_view,
-        .texture_view_size = g.cloud_view_size,
+        .texture = g.atlas_texture,
+        .shader = g.clouds_shader,
+        .user_bind_group_layout = g.effect_bind_group_layout,
+        .user_bind_group = g.effect_bind_group,
         // Alpha blend must preserve destination alpha so that cloud edges don't corrupt
         // the RTT texture's alpha channel (which would cause semi-transparency when the
-        // RTT card renders to screen).
+        // RTT sprite renders to screen).
         .blend_state = gpu.BlendState{
             .color = .{
                 .operation = .add,
@@ -394,11 +422,23 @@ fn setupPipelines(
         },
     });
 
-    // Create a sprite rendering pipeline
-    app.sprite_pipeline_id = try sprite.pipelines.new(.{
+    // Create the render-to-texture pipeline with the pass1.wgsl shader (water reflections),
+    // drawing the scene texture as a single fullscreen sprite.
+    app.rtt_pipeline_id = try sprite.pipelines.new(.{
         .window = app.window_id,
-        .texture = g.atlas_texture,
+        .texture = g.rtt_texture,
+        .blend_state = gpu.BlendState{},
+        .shader = g.pass1_shader,
+        .user_bind_group_layout = g.effect_bind_group_layout,
+        .user_bind_group = g.effect_bind_group,
     });
+    app.rtt_sprite_id = try sprite.objects.new(.{
+        .transform = Mat4x4.translate(vec3(0, 0, 0)),
+        .uv_transform = Mat3x3.translate(vec2(0, 0)),
+        .size = vec2(@floatFromInt(g.rtt_width), @floatFromInt(g.rtt_height)),
+    });
+    try addToRenderList(sprite, app.allocator, app.rtt_pipeline_id, app.rtt_sprite_id);
+    app.rtt_size = vec2(@floatFromInt(g.rtt_width), @floatFromInt(g.rtt_height));
 
     // Create a text rendering pipeline
     app.text_pipeline_id = try text.pipelines.new(.{
@@ -412,7 +452,7 @@ fn setupPipelines(
     app_mod.call(.changeScene);
 }
 
-/// Registers an object with a gfx.Sprite, gfx.Text, or Card pipeline's render list.
+/// Registers an object with a gfx.Sprite or gfx.Text pipeline's render list.
 fn addToRenderList(module: anytype, allocator: std.mem.Allocator, pipeline_id: mach.ObjectID, object_id: mach.ObjectID) !void {
     var render_list = module.pipelines.get(pipeline_id, .render_list);
     try render_list.append(allocator, object_id);
@@ -478,8 +518,9 @@ pub fn snapshot(app: *App) void {
         .scene = app.scene,
         .sprite_pipeline_id = app.sprite_pipeline_id,
         .text_pipeline_id = app.text_pipeline_id,
-        .rtt_card_pipeline_id = app.rtt_card_pipeline_id,
-        .cloud_card_pipeline_id = app.cloud_card_pipeline_id,
+        .rtt_pipeline_id = app.rtt_pipeline_id,
+        .cloud_pipeline_id = app.cloud_pipeline_id,
+        .world_time = app.world_time,
     };
 }
 
@@ -511,13 +552,12 @@ fn clearCurrentScene(
     app: *App,
     audio: *mach.Audio,
     sprite: *gfx.Sprite,
-    card: *Card,
     text: *gfx.Text,
 ) void {
     switch (app.scene) {
         .none => {},
         .start => {
-            // Remove start scene sprites
+            // Remove start scene sprites (including cloud sprites)
             var sprite_iter = sprite.objects.slice();
             while (sprite_iter.next()) |id| {
                 if (sprite.objects.hasTag(id, App, .is_start_scene)) {
@@ -529,13 +569,6 @@ fn clearCurrentScene(
             while (text_iter.next()) |id| {
                 if (text.objects.hasTag(id, App, .is_start_scene)) {
                     text.objects.delete(id);
-                }
-            }
-            // Remove start scene card objects (cloud cards)
-            var card_iter = card.objects.slice();
-            while (card_iter.next()) |id| {
-                if (card.objects.hasTag(id, App, .is_start_scene)) {
-                    card.objects.delete(id);
                 }
             }
             // Remove start scene audio buffers
@@ -556,18 +589,11 @@ fn clearCurrentScene(
             }
         },
         .game => {
-            // Remove game scene sprites
+            // Remove game scene sprites (including cloud sprites)
             var sprite_iter = sprite.objects.slice();
             while (sprite_iter.next()) |id| {
                 if (sprite.objects.hasTag(id, App, .is_game_scene)) {
                     sprite.objects.delete(id);
-                }
-            }
-            // Remove game scene card objects (cloud cards)
-            var card_iter = card.objects.slice();
-            while (card_iter.next()) |id| {
-                if (card.objects.hasTag(id, App, .is_game_scene)) {
-                    card.objects.delete(id);
                 }
             }
             // Remove game scene audio buffers
@@ -595,7 +621,6 @@ pub fn changeScene(
     app: *App,
     audio: *mach.Audio,
     sprite: *gfx.Sprite,
-    card: *Card,
     text: *gfx.Text,
 ) !void {
     if (app.prev_scene == app.scene) return;
@@ -603,7 +628,7 @@ pub fn changeScene(
     // Clean up the previously active scene
     const next_scene = app.scene;
     app.scene = app.prev_scene;
-    clearCurrentScene(app, audio, sprite, card, text);
+    clearCurrentScene(app, audio, sprite, text);
     app.scene = next_scene;
     app.prev_scene = app.scene;
 
@@ -661,17 +686,15 @@ pub fn changeScene(
                 }
             }
 
-            // Create cloud/fog card for the start scene
+            // Create cloud/fog sprite for the start scene
             {
-                const bg_card = try card.objects.new(.{
+                const clouds = try sprite.objects.new(.{
                     .transform = Mat4x4.translate(vec3(-1920 / 2, -1080 / 2, 0)),
                     .uv_transform = Mat3x3.translate(vec2(0, 0)),
                     .size = vec2(1920, 1080),
                 });
-                try addToRenderList(card, app.allocator, app.cloud_card_pipeline_id, bg_card);
-                try card.objects.setTag(bg_card, App, .is_start_scene, null);
-                // Explicitly mark a field as updated so Card.tick refreshes pipeline buffers
-                card.objects.set(bg_card, .size, vec2(1920, 1080));
+                try addToRenderList(sprite, app.allocator, app.cloud_pipeline_id, clouds);
+                try sprite.objects.setTag(clouds, App, .is_start_scene, null);
             }
         },
         .game => {
@@ -765,21 +788,19 @@ pub fn changeScene(
                     break :blk null;
                 };
 
-                // Create a cloud/fog card for parallax layers (matches old behavior where
-                // cloud cards were world-space cards covering the entire layer area)
+                // Create a cloud/fog sprite for parallax layers (a world-space quad covering the
+                // entire layer area)
                 if (parallax != null) {
                     const layer_width: f32 = @floatFromInt(layer.__gridSize * layer.__cWid);
                     const layer_height: f32 = @floatFromInt(layer.__gridSize * layer.__cHei);
 
-                    const bg_card = try card.objects.new(.{
+                    const clouds = try sprite.objects.new(.{
                         .transform = Mat4x4.translate(vec3(0, -layer_height * world_scale, 0)),
                         .uv_transform = Mat3x3.translate(vec2(0, 0)),
                         .size = vec2(layer_width * world_scale, layer_height * world_scale),
                     });
-                    try addToRenderList(card, app.allocator, app.cloud_card_pipeline_id, bg_card);
-                    try card.objects.setTag(bg_card, App, .is_game_scene, null);
-                    // Explicitly mark a field as updated so Card.tick refreshes pipeline buffers
-                    card.objects.set(bg_card, .size, vec2(layer_width * world_scale, layer_height * world_scale));
+                    try addToRenderList(sprite, app.allocator, app.cloud_pipeline_id, clouds);
+                    try sprite.objects.setTag(clouds, App, .is_game_scene, null);
                 }
 
                 building_tiles: for (layer.gridTiles) |tile| {
@@ -1010,7 +1031,6 @@ pub fn updateSfx(
             .flipped = flipped,
         });
     }
-
 }
 
 pub fn pollInput(
@@ -1019,7 +1039,6 @@ pub fn pollInput(
     app_mod: mach.Mod(App),
     sprite: *gfx.Sprite,
     audio: *mach.Audio,
-    card: *Card,
     text: *gfx.Text,
 ) !void {
     var direction = app.direction;
@@ -1065,7 +1084,7 @@ pub fn pollInput(
 
     // Once the render thread has created our GPU resources, create our pipelines and scene.
     if (!app.ready and app.gpu_ready.load(.acquire)) {
-        try setupPipelines(app, app_mod, sprite, card, text);
+        try setupPipelines(app, app_mod, sprite, text);
     }
     app.last_direction = app.direction;
     app.direction = direction;
@@ -1252,7 +1271,6 @@ pub fn updateCamera(
     sprite: *gfx.Sprite,
     text: *gfx.Text,
     app: *App,
-    card: *Card,
 ) !void {
     if (!app.ready) return;
 
@@ -1272,21 +1290,20 @@ pub fn updateCamera(
     const width_px: f32 = 1920.0 * (3.0 / 4.0);
     const height_px: f32 = width_px * (window_height_px / window_width_px);
 
-    // If the render thread recreated the RTT texture (framebuffer resized), point the RTT card at
-    // the new texture. The card pipeline holds its own reference to the old view until it rebuilds.
+    // If the render thread recreated the RTT texture (framebuffer resized), point the RTT pipeline
+    // at the new texture. The pipeline holds its own reference to the old texture until it rebuilds.
     {
         app.pending_rtt_mu.lockUncancelable(app.io);
         defer app.pending_rtt_mu.unlock(app.io);
         if (app.pending_rtt) |rtt| {
             app.pending_rtt = null;
-            const size = vec2(@floatFromInt(rtt.width), @floatFromInt(rtt.height));
-            card.pipelines.set(app.rtt_card_pipeline_id, .texture_view, rtt.view);
-            card.pipelines.set(app.rtt_card_pipeline_id, .texture_view_size, size);
-            card.objects.set(app.rtt_card_id, .size, size);
-            rtt.view.release(); // our hand-off reference; the pipeline references it on rebuild
+            app.rtt_size = vec2(@floatFromInt(rtt.width), @floatFromInt(rtt.height));
+            sprite.pipelines.set(app.rtt_pipeline_id, .texture, rtt.texture);
+            sprite.objects.set(app.rtt_sprite_id, .size, app.rtt_size);
+            rtt.texture.release(); // our hand-off reference; the pipeline references it on rebuild
         }
     }
-    const rtt_size = card.pipelines.get(app.rtt_card_pipeline_id, .texture_view_size);
+    const rtt_size = app.rtt_size;
     const projection = math.Mat4x4.projection2D(.{
         .left = -width_px / 2,
         .right = width_px / 2,
@@ -1316,18 +1333,16 @@ pub fn updateCamera(
     sprite.pipelines.set(app.sprite_pipeline_id, .view_projection, view_projection);
     text.pipelines.set(app.text_pipeline_id, .view_projection, view_projection);
 
-    // Cloud cards use the same camera view_projection as sprites (they're in world space)
-    card.pipelines.set(app.cloud_card_pipeline_id, .view_projection, view_projection);
-    card.pipelines.set(app.cloud_card_pipeline_id, .time, app.world_time);
-    card.pipelines.set(app.rtt_card_pipeline_id, .time, app.world_time);
+    // Cloud sprites use the same camera view_projection as regular sprites (they're in world space)
+    sprite.pipelines.set(app.cloud_pipeline_id, .view_projection, view_projection);
 
-    // The RTT card uses projection only (no camera view) since it's a fullscreen quad.
-    // We scale the card from framebuffer pixels to virtual canvas pixels, and position it
+    // The RTT sprite uses projection only (no camera view) since it's a fullscreen quad.
+    // We scale the sprite from framebuffer pixels to virtual canvas pixels, and position it
     // to fill the screen (centered at origin).
     const scale_x = width_px / rtt_size.x();
     const scale_y = height_px / rtt_size.y();
-    card.pipelines.set(app.rtt_card_pipeline_id, .view_projection, projection);
-    card.objects.set(app.rtt_card_id, .transform, Mat4x4.translate(vec3(
+    sprite.pipelines.set(app.rtt_pipeline_id, .view_projection, projection);
+    sprite.objects.set(app.rtt_sprite_id, .transform, Mat4x4.translate(vec3(
         -width_px / 2,
         -height_px / 2,
         0,
@@ -1357,15 +1372,13 @@ pub fn updateCamera(
 }
 
 /// Called on the render thread. Reads only the render snapshot (app.render_state and the
-/// render-side copies of gfx/card objects), never live app state.
+/// render-side copies of gfx objects), never live app state.
 pub fn renderFrame(
     core: *mach.Core,
     sprite: *gfx.Sprite,
     sprite_mod: mach.Mod(gfx.Sprite),
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
-    card: *Card,
-    card_mod: mach.Mod(Card),
     app: *App,
 ) !void {
     const label = @tagName(mach_module) ++ ".renderFrame";
@@ -1380,23 +1393,30 @@ pub fn renderFrame(
     if (!rs.ready) return;
 
     // Recreate the RTT texture if the framebuffer size changed, and hand it to the app thread
-    // so it can update the RTT card pipeline.
+    // so it can update the RTT sprite pipeline.
     if (window.framebuffer_width != app.gpu_res.rtt_width or window.framebuffer_height != app.gpu_res.rtt_height) {
         app.gpu_res.rtt_view.release();
-        app.gpu_res.rtt_view = createRttView(window.device, window.framebuffer_width, window.framebuffer_height);
+        app.gpu_res.rtt_texture.release();
+        app.gpu_res.rtt_texture = createRttTexture(window.device, window.framebuffer_width, window.framebuffer_height);
+        app.gpu_res.rtt_view = app.gpu_res.rtt_texture.createView(null);
         app.gpu_res.rtt_width = window.framebuffer_width;
         app.gpu_res.rtt_height = window.framebuffer_height;
 
         app.pending_rtt_mu.lockUncancelable(app.io);
         defer app.pending_rtt_mu.unlock(app.io);
-        if (app.pending_rtt) |stale| stale.view.release();
-        app.gpu_res.rtt_view.reference(); // hand-off reference, released by the app thread
+        if (app.pending_rtt) |stale| stale.texture.release();
+        app.gpu_res.rtt_texture.reference(); // hand-off reference, released by the app thread
         app.pending_rtt = .{
-            .view = app.gpu_res.rtt_view,
+            .texture = app.gpu_res.rtt_texture,
             .width = app.gpu_res.rtt_width,
             .height = app.gpu_res.rtt_height,
         };
     }
+
+    // Update per-frame effect parameters for the pass1 and clouds shaders.
+    window.queue.writeBuffer(app.gpu_res.effect_uniforms, 0, &[_]EffectUniforms{.{
+        .params = vec4(rs.world_time, 0, 0, 0).gpu(),
+    }});
 
     const encoder = window.device.createCommandEncoder(&.{ .label = label });
     defer encoder.release();
@@ -1428,15 +1448,12 @@ pub fn renderFrame(
             .color_attachments = &rtt_color_attachments,
         }));
 
-        // Render sprites
+        // Render sprites, then cloud/fog sprites on top (in world space). The RTT pipeline must
+        // not render here, since it samples the texture this pass renders into.
+        sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, null);
         sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, render_pass);
+        sprite.pipelines.setRaw(rs.cloud_pipeline_id, .render_pass, render_pass);
         sprite_mod.call(.render);
-
-        // Render cloud/fog cards (on top of sprites, in world space)
-        // Only the cloud pipeline should render here — ensure the RTT pipeline is disabled.
-        card.pipelines.setRaw(rs.rtt_card_pipeline_id, .render_pass, null);
-        card.pipelines.setRaw(rs.cloud_card_pipeline_id, .render_pass, render_pass);
-        card_mod.call(.render);
 
         // Finish render pass
         render_pass.end();
@@ -1458,11 +1475,12 @@ pub fn renderFrame(
             .color_attachments = &color_attachments,
         }));
 
-        // Render the RTT card (post-processing: water reflections)
-        // Only the RTT pipeline should render here — ensure the cloud pipeline is disabled.
-        card.pipelines.setRaw(rs.cloud_card_pipeline_id, .render_pass, null);
-        card.pipelines.setRaw(rs.rtt_card_pipeline_id, .render_pass, render_pass);
-        card_mod.call(.render);
+        // Render the RTT sprite (post-processing: water reflections). Only the RTT pipeline
+        // should render here.
+        sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, null);
+        sprite.pipelines.setRaw(rs.cloud_pipeline_id, .render_pass, null);
+        sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, render_pass);
+        sprite_mod.call(.render);
 
         // Render text on top of everything (so it's not affected by water reflections)
         text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, render_pass);
@@ -1474,8 +1492,7 @@ pub fn renderFrame(
     }
 
     // Clear the transient render pass pointers, since the passes have been released.
-    sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, null);
-    card.pipelines.setRaw(rs.rtt_card_pipeline_id, .render_pass, null);
+    sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, null);
     text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, null);
 
     // Finish the frame

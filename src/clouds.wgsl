@@ -15,10 +15,19 @@ struct Uniforms {
   view_projection: mat4x4<f32>,
 
   // Total size of the sprite texture in pixels
-  texture_size: vec4<f32>,
+  texture_size: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+// Effect parameters provided by the app via gfx.Sprite's user bind group (@group(1)).
+// Must match `EffectUniforms` in App.zig.
+struct Effect {
+  // x = world time in seconds; yzw unused.
+  params: vec4<f32>,
+};
+
+@group(1) @binding(0) var<uniform> effect : Effect;
 
 // Sprite model transformation matrices
 @group(0) @binding(1) var<storage, read> sprite_transforms: array<mat4x4<f32>>;
@@ -95,7 +104,7 @@ fn fragMain(
   @location(0) uv: vec2<f32>
 ) -> @location(0) vec4<f32> {
     // Clouds and fog
-    let time: f32 = uniforms.texture_size.z + 50; // add 50s so that we're already into the animation starting
+    let time: f32 = effect.params.x + 50; // add 50s so that we're already into the animation starting
     // Fog
 	let fog_speed: vec2<f32> = vec2<f32>(0.2, 0.);
 	let fog_color: vec3<f32> = vec3<f32>(1., 1., 1.);

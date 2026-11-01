@@ -14,11 +14,20 @@ struct Uniforms {
   // The view * orthographic projection matrix
   view_projection: mat4x4<f32>,
 
-  // Total size of the sprite texture in pixels (xy), time (z), unused (w)
-  texture_size: vec4<f32>,
+  // Total size of the sprite texture in pixels
+  texture_size: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+// Effect parameters provided by the app via gfx.Sprite's user bind group (@group(1)).
+// Must match `EffectUniforms` in App.zig.
+struct Effect {
+  // x = world time in seconds; yzw unused.
+  params: vec4<f32>,
+};
+
+@group(1) @binding(0) var<uniform> effect : Effect;
 
 // Sprite model transformation matrices
 @group(0) @binding(1) var<storage, read> sprite_transforms: array<mat4x4<f32>>;
@@ -101,7 +110,7 @@ fn fragMain(
     }
 
     // Water reflections
-    let time: f32 = uniforms.texture_size.z + 50; // add 50s so that we're already into the animation starting
+    let time: f32 = effect.params.x + 50; // add 50s so that we're already into the animation starting
     let water_height = 0.8;
     if (uv.y > water_height) {
         let iuv = vec2<f32>(uv.x, ((1.-uv.y) + water_height) - (1.-water_height));

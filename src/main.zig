@@ -8,7 +8,6 @@ const Modules = mach.Modules(.{
     mach.gfx.Text,
     mach.Audio,
     @import("App.zig"),
-    @import("Card.zig"),
 });
 
 // TODO: move this to a mach "entrypoint" zig module which handles nuances like WASM requires.
