@@ -10,6 +10,8 @@ const Modules = mach.Modules(.{
     @import("App.zig"),
 });
 
+const mib = 1024 * 1024;
+
 /// Memory budgets for modules with their own preallocated pool. Modules not listed here (e.g.
 /// mach.Core, which also owns GPU backend state) use `global_allocator`.
 ///
@@ -21,27 +23,21 @@ const Modules = mach.Modules(.{
 /// - mach_gfx_text: 4.0 MiB
 /// - mach_audio: 208 MiB, during the scene change: the start scene's bgm is still alive while the
 ///   game scene's bgm is decoded. ~98 MiB steady state in the game scene.
-const budgets = .{
+const budgets: Modules.InitOptions = .{ .budgets = .{
     .app = 32 * mib,
     .mach_gfx_sprite = 16 * mib,
     .mach_gfx_text = 16 * mib,
     .mach_audio = 320 * mib,
-};
-const mib = 1024 * 1024;
+} };
 
-/// General-purpose fallback allocator for modules without a pool.
+/// General-purpose allocator for modules without a budget.
 const global_allocator = std.heap.smp_allocator;
 
-var pools: struct {
-    app: mach.PoolAllocator,
-    mach_gfx_sprite: mach.PoolAllocator,
-    mach_gfx_text: mach.PoolAllocator,
-    mach_audio: mach.PoolAllocator,
-} = undefined;
+var mods: Modules = undefined;
 
-/// Logs usage of every pool. Called by App on exit.
+/// Logs usage of every module's memory pool. Called by App on exit.
 pub fn reportMemory() void {
-    inline for (@typeInfo(@TypeOf(pools)).@"struct".field_names) |name| @field(pools, name).report();
+    mods.reportMemory();
 }
 
 // TODO: move this to a mach "entrypoint" zig module which handles nuances like WASM requires.
@@ -49,26 +45,7 @@ pub fn main() !void {
     var io_threaded = std.Io.Threaded.init(global_allocator, .{});
     const io = io_threaded.io();
 
-    // Reserve one block for all pools up front. Pages are committed lazily by the OS as pools
-    // first touch them, so unused budget costs address space, not RAM.
-    var total: usize = 0;
-    inline for (@typeInfo(@TypeOf(budgets)).@"struct".field_names) |name| total += @field(budgets, name);
-    const block = try std.heap.page_allocator.alloc(u8, total);
-
-    var offset: usize = 0;
-    inline for (@typeInfo(@TypeOf(budgets)).@"struct".field_names) |name| {
-        const size = @field(budgets, name);
-        @field(pools, name) = mach.PoolAllocator.init(name, block[offset..][0..size], io);
-        offset += size;
-    }
-
-    var mods: Modules = undefined;
-    try mods.initOptions(global_allocator, io, .{ .allocators = .{
-        .app = pools.app.allocator(),
-        .mach_gfx_sprite = pools.mach_gfx_sprite.allocator(),
-        .mach_gfx_text = pools.mach_gfx_text.allocator(),
-        .mach_audio = pools.mach_audio.allocator(),
-    } });
+    try mods.initOptions(global_allocator, io, budgets);
     // TODO: enable mods.deinit(allocator); for allocator leak detection
     // defer mods.deinit(allocator);
 
