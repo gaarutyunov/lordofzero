@@ -15,7 +15,7 @@ const mib = 1024 * 1024;
 /// Memory budgets for modules with their own preallocated pool. Modules not listed here (e.g.
 /// mach.Core, which also owns GPU backend state) use `global_allocator`.
 ///
-/// Sized from the high-water marks logged on exit (see `reportMemory`), with headroom. Measured
+/// Sized from the high-water marks logged on exit (see App.deinitApp), with headroom. Measured
 /// high-water marks playing through the start scene into the game scene:
 ///
 /// - app: 12.5 MiB (atlas/level parsing, texture decode at startup)
@@ -33,18 +33,12 @@ const budgets: Modules.InitOptions = .{ .budgets = .{
 /// General-purpose allocator for modules without a budget.
 const global_allocator = std.heap.smp_allocator;
 
-var mods: Modules = undefined;
-
-/// Logs usage of every module's memory pool. Called by App on exit.
-pub fn reportMemory() void {
-    mods.reportMemory();
-}
-
 // TODO: move this to a mach "entrypoint" zig module which handles nuances like WASM requires.
 pub fn main() !void {
     var io_threaded = std.Io.Threaded.init(global_allocator, .{});
     const io = io_threaded.io();
 
+    var mods: Modules = undefined;
     try mods.initOptions(global_allocator, io, budgets);
     // TODO: enable mods.deinit(allocator); for allocator leak detection
     // defer mods.deinit(allocator);

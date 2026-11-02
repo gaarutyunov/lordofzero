@@ -243,9 +243,10 @@ pub fn init(
     audio: *mach.Audio,
     app: *App,
     app_mod: mach.Mod(App),
-    io: std.Io,
-    allocator: std.mem.Allocator,
+    ctx: mach.Context,
 ) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
     core.on_exit = app_mod.id.deinit;
 
     // Configure the audio module to call our App.audioStateChange function when a sound buffer
@@ -293,12 +294,11 @@ pub fn init(
 }
 
 /// Stops the app thread. Runs first on exit, so the remaining deinit steps don't race with it.
-pub fn deinitApp(app: *App) void {
+pub fn deinitApp(app: *App, ctx: mach.Context) void {
     app.app_thread.join();
 
-    // Log memory pool usage (see main.zig), to help size the pool budgets.
-    const root = @import("root");
-    if (@hasDecl(root, "reportMemory")) root.reportMemory();
+    // Log memory pool usage, to help size the budgets in main.zig.
+    ctx.reportMemory();
 }
 
 pub fn deinit2(
