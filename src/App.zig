@@ -244,6 +244,7 @@ pub fn init(
     app: *App,
     app_mod: mach.Mod(App),
     io: std.Io,
+    allocator: std.mem.Allocator,
 ) !void {
     core.on_exit = app_mod.id.deinit;
 
@@ -259,9 +260,6 @@ pub fn init(
         // Make the window fullscreen before it opens, if you want:
         // .fullscreen = true,
     });
-
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
 
     // Load pixi atlas file
     const parsed_atlas = try pixi.Atlas.parseSlice(allocator, assets.lordofzero_atlas);

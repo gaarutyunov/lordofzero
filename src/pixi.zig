@@ -35,11 +35,7 @@ pub const LDTKCompatibility = struct {
                 //
                 //         layer_path=pixi-ldtk/src/tiles/tileset_64x320__Layer_0.png
                 // current_layer_path=pixi-ldtk/src/tiles/tileset_64x320__Layer 0.png
-                // std.debug.print("layer_path={s} current_layer_path={s}\n", .{ layer_path, current_layer_path });
-                // std.mem.replace(comptime T: type, input: []const T, needle: []const T, replacement: []const T, output: []T)
-                const current_layer_path_fixed = std.mem.replaceOwned(u8, std.heap.page_allocator, current_layer_path, " ", "_") catch unreachable;
-
-                if (std.mem.eql(u8, layer_path, current_layer_path_fixed)) {
+                if (eqlSpaceAsUnderscore(layer_path, current_layer_path)) {
                     for (tileset.sprites) |current_sprite| {
                         if (sprite_src[0] == current_sprite.src[0] and sprite_src[1] == current_sprite.src[1]) {
                             return current_sprite;
@@ -51,6 +47,15 @@ pub const LDTKCompatibility = struct {
         return null;
     }
 };
+
+/// Like std.mem.eql, but treats ' ' in `b` as equal to '_' in `a`.
+fn eqlSpaceAsUnderscore(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (ca != (if (cb == ' ') '_' else cb)) return false;
+    }
+    return true;
+}
 
 pub const LDTKSprite = struct {
     name: [:0]const u8,
