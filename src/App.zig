@@ -295,6 +295,10 @@ pub fn init(
 /// Stops the app thread. Runs first on exit, so the remaining deinit steps don't race with it.
 pub fn deinitApp(app: *App) void {
     app.app_thread.join();
+
+    // Log memory pool usage (see main.zig), to help size the pool budgets.
+    const root = @import("root");
+    if (@hasDecl(root, "reportMemory")) root.reportMemory();
 }
 
 pub fn deinit2(
