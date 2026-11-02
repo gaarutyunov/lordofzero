@@ -1,6 +1,5 @@
 const std = @import("std");
 const mach = @import("mach");
-const Pool = @import("Pool.zig");
 
 // The set of Mach modules our application may use.
 const Modules = mach.Modules(.{
@@ -34,10 +33,10 @@ const mib = 1024 * 1024;
 const global_allocator = std.heap.smp_allocator;
 
 var pools: struct {
-    app: Pool,
-    mach_gfx_sprite: Pool,
-    mach_gfx_text: Pool,
-    mach_audio: Pool,
+    app: mach.PoolAllocator,
+    mach_gfx_sprite: mach.PoolAllocator,
+    mach_gfx_text: mach.PoolAllocator,
+    mach_audio: mach.PoolAllocator,
 } = undefined;
 
 /// Logs usage of every pool. Called by App on exit.
@@ -59,7 +58,7 @@ pub fn main() !void {
     var offset: usize = 0;
     inline for (@typeInfo(@TypeOf(budgets)).@"struct".field_names) |name| {
         const size = @field(budgets, name);
-        @field(pools, name) = Pool.init(name, block[offset..][0..size], io);
+        @field(pools, name) = mach.PoolAllocator.init(name, block[offset..][0..size], io);
         offset += size;
     }
 
@@ -75,8 +74,4 @@ pub fn main() !void {
 
     const app = mods.get(.app);
     app.run(.main);
-}
-
-test {
-    _ = Pool;
 }
