@@ -243,8 +243,10 @@ pub fn init(
     audio: *mach.Audio,
     app: *App,
     app_mod: mach.Mod(App),
-    io: std.Io,
+    ctx: mach.Context,
 ) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
     core.on_exit = app_mod.id.deinit;
 
     // Configure the audio module to call our App.audioStateChange function when a sound buffer
@@ -259,9 +261,6 @@ pub fn init(
         // Make the window fullscreen before it opens, if you want:
         // .fullscreen = true,
     });
-
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
 
     // Load pixi atlas file
     const parsed_atlas = try pixi.Atlas.parseSlice(allocator, assets.lordofzero_atlas);
@@ -295,8 +294,11 @@ pub fn init(
 }
 
 /// Stops the app thread. Runs first on exit, so the remaining deinit steps don't race with it.
-pub fn deinitApp(app: *App) void {
+pub fn deinitApp(app: *App, ctx: mach.Context) void {
     app.app_thread.join();
+
+    // Log memory pool usage, to help size the budgets in main.zig.
+    ctx.reportMemory();
 }
 
 pub fn deinit2(
