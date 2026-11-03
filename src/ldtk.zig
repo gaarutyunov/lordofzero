@@ -11,6 +11,7 @@
 /// * Do not support 'Super Simple Export' - this is a different, less interesting LDTK export format.
 ///
 const std = @import("std");
+const mach = @import("mach");
 const testing = std.testing;
 
 pub const ParsedFile = std.json.Parsed(File);
@@ -23,7 +24,10 @@ pub const File = struct {
     /// Helper to parse a file given its bytes.
     ///
     /// The caller is responsible for calling deinit() when done with the result.
-    pub fn parseSlice(allocator: std.mem.Allocator, bytes: []const u8) !ParsedFile {
+    pub fn parseSlice(ctx: mach.Context, bytes: []const u8) !ParsedFile {
+        const zone = mach.tracy.initZone(@src(), .{});
+        defer zone.deinit();
+        const allocator = ctx.allocator;
         var scanner = std.json.Scanner.initCompleteInput(allocator, bytes);
         defer scanner.deinit();
 
@@ -34,7 +38,7 @@ pub const File = struct {
             .duplicate_field_behavior = .@"error",
             .ignore_unknown_fields = true,
         }) catch |err| {
-            std.log.debug("parsing .ldtk file failed at line {d} column {d}\n", .{ diagnostics.getLine(), diagnostics.getColumn() });
+            ctx.err("parsing .ldtk file failed at line {d} column {d}: {s}", .{ diagnostics.getLine(), diagnostics.getColumn(), @errorName(err) });
             return err;
         };
 

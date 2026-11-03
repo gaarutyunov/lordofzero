@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sysgpu_backend = b.option(SysgpuBackend, "sysgpu_backend", "sysgpu API backend") orelse .default;
+    const tracy = b.option(bool, "tracy", "Enable Tracy profiling (zones, allocations, per-module memory plots)") orelse false;
 
     const assets = b.addModule("assets", .{
         .root_source_file = b.path("assets/main.zig"),
@@ -36,6 +37,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .sysgpu_backend = sysgpu_backend,
+        .tracy = tracy,
     });
     exe_mod.addImport("mach", mach_dep.module("mach"));
 
