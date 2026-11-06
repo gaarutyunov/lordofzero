@@ -3,6 +3,7 @@ const zigimg = @import("zigimg");
 const mach = @import("mach");
 const gpu = mach.gpu;
 const gfx = mach.gfx;
+const dvx = mach.dvx;
 const math = mach.math;
 const time = mach.time;
 const assets = @import("assets");
@@ -62,6 +63,7 @@ pub const main = mach.schedule(.{
     .{ mach.Audio, .init },
     .{ gfx.Sprite, .init },
     .{ gfx.Text, .init },
+    .{ dvx.DevOverlay, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
@@ -85,6 +87,7 @@ pub const update = mach.schedule(.{
     .{ App, .updateAnims },
     .{ App, .updateSfx },
     .{ App, .updateCamera },
+    .{ dvx.DevOverlay, .update },
 });
 
 /// Frees objects deleted this tick. App sprites must be freed before gfx sprites, since they are
@@ -102,6 +105,7 @@ pub const snapshotFrame = mach.schedule(.{
     .{ gfx.Sprite, .snapshot },
     .{ gfx.Text, .snapshot },
     .{ App, .snapshot },
+    .{ dvx.DevOverlay, .snapshot },
     .{ mach.Core, .snapshotEnd },
 });
 
@@ -241,6 +245,7 @@ pub fn init(
     core: *mach.Core,
     core_mod: mach.Mod(mach.Core),
     audio: *mach.Audio,
+    overlay: *dvx.DevOverlay,
     app: *App,
     app_mod: mach.Mod(App),
     ctx: mach.Context,
@@ -261,10 +266,11 @@ pub fn init(
         // Make the window fullscreen before it opens, if you want:
         // .fullscreen = true,
     });
+    overlay.attach(window_id);
 
     // Load pixi atlas file
-    const parsed_atlas = try pixi.Atlas.parseSlice(allocator, assets.lordofzero_atlas);
-    std.debug.print("loaded sprite atlas: {} sprites, {} animations\n", .{
+    const parsed_atlas = try pixi.Atlas.parseSlice(ctx, assets.lordofzero_atlas);
+    ctx.info("loaded sprite atlas: {} sprites, {} animations", .{
         parsed_atlas.value.sprites.len,
         parsed_atlas.value.animations.len,
     });
@@ -280,9 +286,9 @@ pub fn init(
         .player_sprite_timer = time.Timer.start(io),
         .rand = std.Random.DefaultPrng.init(1337),
         .parsed_atlas = parsed_atlas,
-        .parsed_ldtk_compatibility = try pixi.LDTKCompatibility.parseSlice(allocator, assets.pixi_ldtk_json),
+        .parsed_ldtk_compatibility = try pixi.LDTKCompatibility.parseSlice(ctx, assets.pixi_ldtk_json),
         // Preload .ldtk level file
-        .parsed_level = try ldtk.File.parseSlice(allocator, assets.level_ldtk),
+        .parsed_level = try ldtk.File.parseSlice(ctx, assets.level_ldtk),
         .sfx_morning_bells = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.morning_bells }),
         .sfx_footsteps = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.footsteps }),
         .sfx_freeze = try mach.Audio.Opus.decodeStream(allocator, .{ .data = assets.sfx.freeze }),
@@ -331,6 +337,8 @@ pub fn deinit2(
 /// Creates GPU resources. Called once on the render thread, since that is where all GPU work
 /// happens. The app thread picks these up in setupPipelines once `gpu_ready` is set.
 fn setupGpu(app: *App, window: anytype) !void {
+    const zone = mach.tracy.initZone(@src(), .{});
+    defer zone.deinit();
     // Create the texture we'll render our scene to for post-processing effects.
     // Sized to the window's framebuffer (actual pixel dimensions including DPI scaling).
     // Recreated on window resize in renderFrame.
@@ -390,6 +398,8 @@ fn setupPipelines(
     sprite: *gfx.Sprite,
     text: *gfx.Text,
 ) !void {
+    const zone = mach.tracy.initZone(@src(), .{});
+    defer zone.deinit();
     const g = app.gpu_res;
 
     // Create a sprite rendering pipeline. Created first so it renders before (beneath) the
@@ -464,6 +474,8 @@ fn addToRenderList(module: anytype, allocator: std.mem.Allocator, pipeline_id: m
 /// Plays a decoded sound effect, by copying its samples into a new mach.Audio buffer (which
 /// mach.Audio.cleanup frees once the buffer is deleted.)
 fn playSfx(app: *App, audio: *mach.Audio, sfx: mach.Audio.Opus, volume: f32, scene_tag: ?Scene) !void {
+    const zone = mach.tracy.initZone(@src(), .{});
+    defer zone.deinit();
     const samples = try audio.allocSamples(sfx.samples.len);
     @memcpy(samples, sfx.samples);
 
@@ -482,6 +494,8 @@ fn playSfx(app: *App, audio: *mach.Audio, sfx: mach.Audio.Opus, volume: f32, sce
 
 /// Decodes and plays looping background music for the given scene.
 fn playBgm(audio: *mach.Audio, opus_data: []const u8, scene: Scene) !void {
+    const zone = mach.tracy.initZone(@src(), .{});
+    defer zone.deinit();
     // Decode using the audio allocator, since mach.Audio.cleanup frees the samples.
     const bgm = try mach.Audio.Opus.decodeStream(audio.allocator, .{ .data = opus_data });
 
@@ -556,6 +570,8 @@ fn clearCurrentScene(
     sprite: *gfx.Sprite,
     text: *gfx.Text,
 ) void {
+    const zone = mach.tracy.initZone(@src(), .{});
+    defer zone.deinit();
     switch (app.scene) {
         .none => {},
         .start => {
@@ -624,8 +640,10 @@ pub fn changeScene(
     audio: *mach.Audio,
     sprite: *gfx.Sprite,
     text: *gfx.Text,
+    ctx: mach.Context,
 ) !void {
     if (app.prev_scene == app.scene) return;
+    ctx.info("changing scene: {s} -> {s}", .{ @tagName(app.prev_scene), @tagName(app.scene) });
 
     // Clean up the previously active scene
     const next_scene = app.scene;
@@ -756,10 +774,12 @@ pub fn changeScene(
                 break;
             }
 
-            std.debug.print("loading level: {s} {}x{}px, layers: {}\n", .{ level.identifier, level.pxWid, level.pxHei, level.layerInstances.?.len });
+            ctx.info("loading level: {s} {}x{}px, layers: {}", .{ level.identifier, level.pxWid, level.pxHei, level.layerInstances.?.len });
+            const level_zone = mach.tracy.initZone(@src(), .{ .name = "load level" });
+            defer level_zone.deinit();
             var z_layer: f32 = 0.0;
             for (level.layerInstances.?) |layer| {
-                std.debug.print(" layer: {s}, type={s}, visible={}, grid_size={}px, {}x{} (grid-based size)\n", .{
+                ctx.debug("layer: {s}, type={s}, visible={}, grid_size={}px, {}x{} (grid-based size)", .{
                     layer.__identifier,
                     @tagName(layer.__type),
                     layer.visible,
@@ -767,7 +787,8 @@ pub fn changeScene(
                     layer.__cWid,
                     layer.__cHei,
                 });
-                std.debug.print("        pxTotalOffset={},{}, entities={}, grid_tiles={}, tileset={?s}\n", .{
+                ctx.debug("layer: {s}, pxTotalOffset={},{}, entities={}, grid_tiles={}, tileset={?s}", .{
+                    layer.__identifier,
                     layer.__pxTotalOffsetX,
                     layer.__pxTotalOffsetY,
                     layer.entityInstances.len,
@@ -1042,6 +1063,7 @@ pub fn pollInput(
     sprite: *gfx.Sprite,
     audio: *mach.Audio,
     text: *gfx.Text,
+    overlay: *dvx.DevOverlay,
 ) !void {
     var direction = app.direction;
     var player_wants_to_attack = app.player_wants_to_attack;
@@ -1050,6 +1072,8 @@ pub fn pollInput(
     while (iter.next()) |event| {
         switch (event) {
             .key_press => |ev| {
+                // The dev overlay's toggle chord must not e.g. start the game.
+                if (overlay.handleKey(ev)) continue;
                 switch (ev.key) {
                     .left => direction.v[0] -= 1,
                     .right => direction.v[0] += 1,
@@ -1096,13 +1120,23 @@ pub fn pollInput(
     const dt = app.delta_timer.lap();
     app.delta_time = dt;
     app.world_time += dt;
+    mach.tracy.plot(f32, "app tick ms", dt * 1000);
 }
 
 pub fn updateScene(
     app: *App,
     app_mod: mach.Mod(App),
+    overlay: *dvx.DevOverlay,
 ) !void {
     if (!app.ready) return;
+    if (overlay.visible) {
+        var app_sprites: usize = 0;
+        var it = app.sprites.slice();
+        while (it.next()) |_| app_sprites += 1;
+        overlay.setAppInfo("scene: {s}   player x={d:.0}   app sprites: {d}", .{
+            @tagName(app.scene), app.player_position.x(), app_sprites,
+        });
+    }
     // Check if a pending scene change is ready (e.g. waiting for sfx to finish)
     if (app.pending_scene) |next_scene| {
         if (app.pending_scene_timer.read() >= 2.0) {
@@ -1351,6 +1385,8 @@ pub fn updateCamera(
     )).mul(&Mat4x4.scale(vec3(scale_x, scale_y, 1))));
 
     // Apply parallax offset to sprites on parallax layers — they scroll slower than the camera
+    const parallax_zone = mach.tracy.initZone(@src(), .{ .name = "parallax" });
+    defer parallax_zone.deinit();
     const atlas = app.parsed_atlas.value;
     var sprites_iter = app.sprites.slice();
     while (sprites_iter.next()) |app_sprite_id| {
@@ -1381,6 +1417,7 @@ pub fn renderFrame(
     sprite_mod: mach.Mod(gfx.Sprite),
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
+    overlay: *dvx.DevOverlay,
     app: *App,
 ) !void {
     const label = @tagName(mach_module) ++ ".renderFrame";
@@ -1497,6 +1534,9 @@ pub fn renderFrame(
     sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, null);
     text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, null);
 
+    // Draw the dev overlay (if shown) on top of everything.
+    overlay.render(core, encoder, back_buffer_view, sprite, sprite_mod, text, text_mod);
+
     // Finish the frame
     var command = encoder.finish(&.{ .label = label });
     window.queue.submit(&[_]*gpu.CommandBuffer{command});
@@ -1514,6 +1554,8 @@ pub fn renderFrame(
 
 // TODO(sprite): don't require users to copy / write this helper themselves
 fn loadTexture(device: *gpu.Device, queue: *gpu.Queue, allocator: std.mem.Allocator, png_bytes: []const u8) !*gpu.Texture {
+    const zone = mach.tracy.initZone(@src(), .{});
+    defer zone.deinit();
     // Load the image from memory
     var img = try zigimg.Image.fromMemory(allocator, png_bytes);
     defer img.deinit(allocator);

@@ -6,6 +6,7 @@ const Modules = mach.Modules(.{
     mach.Core,
     mach.gfx.Sprite,
     mach.gfx.Text,
+    mach.dvx.DevOverlay,
     mach.Audio,
     @import("App.zig"),
 });
@@ -15,7 +16,9 @@ const mib = 1024 * 1024;
 /// Memory budgets for modules with their own preallocated pool. Modules not listed here (e.g.
 /// mach.Core, which also owns GPU backend state) use `global_allocator`.
 ///
-/// Sized from the high-water marks logged on exit (see App.deinitApp), with headroom. Measured
+/// Sized from the high-water marks logged on exit (see App.deinitApp), with headroom; the dev
+/// overlay (Ctrl+Alt+Shift+D) shows live usage, peaks and a suggested budget per module. Both need
+/// a build with -Dmetrics. Measured
 /// high-water marks playing through the start scene into the game scene:
 ///
 /// - app: 12.5 MiB (atlas/level parsing, texture decode at startup)
@@ -30,11 +33,15 @@ const budgets: Modules.InitOptions = .{ .budgets = .{
     .mach_audio = 320 * mib,
 } };
 
-/// General-purpose allocator for modules without a budget.
-const global_allocator = std.heap.smp_allocator;
-
 // TODO: move this to a mach "entrypoint" zig module which handles nuances like WASM requires.
 pub fn main() !void {
+    mach.tracy.setThreadName("main");
+
+    // General-purpose allocator for modules without a budget. With -Dtracy, reported to Tracy as
+    // the "global" memory pool (budgeted modules show up as their own pools).
+    var global_tracing = mach.tracy.TracingAllocator.initNamed("global", std.heap.smp_allocator);
+    const global_allocator = if (mach.tracy_enabled) global_tracing.allocator() else std.heap.smp_allocator;
+
     var io_threaded = std.Io.Threaded.init(global_allocator, .{});
     const io = io_threaded.io();
 
