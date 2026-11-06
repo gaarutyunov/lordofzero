@@ -3,6 +3,7 @@ const zigimg = @import("zigimg");
 const mach = @import("mach");
 const gpu = mach.gpu;
 const gfx = mach.gfx;
+const dvx = mach.dvx;
 const math = mach.math;
 const time = mach.time;
 const assets = @import("assets");
@@ -62,7 +63,7 @@ pub const main = mach.schedule(.{
     .{ mach.Audio, .init },
     .{ gfx.Sprite, .init },
     .{ gfx.Text, .init },
-    .{ gfx.DevOverlay, .init },
+    .{ dvx.DevOverlay, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
@@ -86,7 +87,7 @@ pub const update = mach.schedule(.{
     .{ App, .updateAnims },
     .{ App, .updateSfx },
     .{ App, .updateCamera },
-    .{ gfx.DevOverlay, .update },
+    .{ dvx.DevOverlay, .update },
 });
 
 /// Frees objects deleted this tick. App sprites must be freed before gfx sprites, since they are
@@ -104,7 +105,7 @@ pub const snapshotFrame = mach.schedule(.{
     .{ gfx.Sprite, .snapshot },
     .{ gfx.Text, .snapshot },
     .{ App, .snapshot },
-    .{ gfx.DevOverlay, .snapshot },
+    .{ dvx.DevOverlay, .snapshot },
     .{ mach.Core, .snapshotEnd },
 });
 
@@ -244,7 +245,7 @@ pub fn init(
     core: *mach.Core,
     core_mod: mach.Mod(mach.Core),
     audio: *mach.Audio,
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
     app: *App,
     app_mod: mach.Mod(App),
     ctx: mach.Context,
@@ -1062,7 +1063,7 @@ pub fn pollInput(
     sprite: *gfx.Sprite,
     audio: *mach.Audio,
     text: *gfx.Text,
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
 ) !void {
     var direction = app.direction;
     var player_wants_to_attack = app.player_wants_to_attack;
@@ -1125,7 +1126,7 @@ pub fn pollInput(
 pub fn updateScene(
     app: *App,
     app_mod: mach.Mod(App),
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
 ) !void {
     if (!app.ready) return;
     if (overlay.visible) {
@@ -1416,7 +1417,7 @@ pub fn renderFrame(
     sprite_mod: mach.Mod(gfx.Sprite),
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
     app: *App,
 ) !void {
     const label = @tagName(mach_module) ++ ".renderFrame";
