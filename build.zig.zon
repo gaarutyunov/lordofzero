@@ -6,7 +6,7 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .mach = .{
-            .url = "git+https://github.com/gaarutyunov/mach#b72620ffaf8fdb71bda50b3eff4d661960431c00",
+            .url = "git+https://github.com/gaarutyunov/mach#884b5ce158f3e25829a66d45a2c43669e54b894b",
             .hash = "mach-0.5.0-jXwHfVYyNgAnwUxkWOEkVguy5onCeByf0m689Nw_7LmJ",
         },
         .zigimg = .{
