@@ -17,7 +17,8 @@ const mib = 1024 * 1024;
 /// mach.Core, which also owns GPU backend state) use `global_allocator`.
 ///
 /// Sized from the high-water marks logged on exit (see App.deinitApp), with headroom; the dev
-/// overlay (Ctrl+Alt+Shift+D) shows live usage, peaks and a suggested budget per module. Measured
+/// overlay (Ctrl+Alt+Shift+D) shows live usage, peaks and a suggested budget per module. Both need
+/// a build with -Dmetrics. Measured
 /// high-water marks playing through the start scene into the game scene:
 ///
 /// - app: 12.5 MiB (atlas/level parsing, texture decode at startup)
