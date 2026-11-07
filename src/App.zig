@@ -27,7 +27,6 @@ pub const mach_systems = .{
     .main,
     .init,
     .tick,
-    .update,
     .cleanup,
     .snapshotFrame,
     .render,
@@ -38,6 +37,7 @@ pub const mach_systems = .{
     .pollInput,
     .cleanupSprites,
     .snapshot,
+    .setupPipelines,
     .changeScene,
     .updateScene,
     .updateSceneStart,
@@ -45,7 +45,13 @@ pub const mach_systems = .{
     .updateAnims,
     .updateSfx,
     .updateCamera,
-    .renderFrame,
+    .setupGpu,
+    .beginFrame,
+    .renderScene,
+    .beginScenePass,
+    .renderComposite,
+    .beginCompositePass,
+    .endFrame,
 };
 
 pub const mach_tags = .{
@@ -74,20 +80,33 @@ pub const deinit = mach.schedule(.{
     .{ mach.Audio, .deinit },
 });
 
+pub const TickParams = struct {
+    /// Set by the render thread once it has created our GPU resources (`gpu_res`), until
+    /// setupPipelines picks them up.
+    gpu_ready: std.atomic.Value(bool) = .init(false),
+    /// Once setupPipelines has run.
+    ready: bool = false,
+    /// Whether `scene` changed, and changeScene must load it.
+    scene_changed: bool = false,
+    /// Which scene is loaded, set by changeScene.
+    start_scene: bool = false,
+    game_scene: bool = false,
+};
+
 /// Runs in a loop on the app thread (see mach.startThread in App.init.)
-pub const tick = mach.schedule(.{
-    .{ App, .update },
+pub const tick = mach.scheduleWith(TickParams, .{
+    .{ App, .pollInput },
+    .{ App, .setupPipelines, .gpu_ready },
+    .{ App, .updateScene, .ready },
+    .{ App, .changeScene, .scene_changed },
+    .{ App, .updateSceneStart, .start_scene },
+    .{ App, .updateSceneGame, .game_scene },
+    .{ App, .updateAnims, .ready },
+    .{ App, .updateSfx, .ready },
+    .{ App, .updateCamera, .ready },
+    .{ dvx.DevOverlay, .update },
     .{ App, .cleanup },
     .{ App, .snapshotFrame },
-});
-
-pub const update = mach.schedule(.{
-    .{ App, .pollInput },
-    .{ App, .updateScene },
-    .{ App, .updateAnims },
-    .{ App, .updateSfx },
-    .{ App, .updateCamera },
-    .{ dvx.DevOverlay, .update },
 });
 
 /// Frees objects deleted this tick. App sprites must be freed before gfx sprites, since they are
@@ -109,9 +128,42 @@ pub const snapshotFrame = mach.schedule(.{
     .{ mach.Core, .snapshotEnd },
 });
 
-pub const render = mach.schedule(.{
-    .{ App, .renderFrame },
+pub const RenderParams = struct {
+    /// Whether the render thread has yet to create our GPU resources, see setupGpu.
+    needs_setup: bool = true,
+};
+
+/// Runs on the render thread. Reads only the render snapshot (app.render_state and the render-side
+/// copies of gfx objects), never live app state.
+pub const render = mach.scheduleWith(RenderParams, .{
+    .{ App, .setupGpu, .needs_setup },
+    .{ App, .beginFrame },
+    .{ App, .renderScene },
+    .{ App, .renderComposite },
+    .{ dvx.DevOverlay, .render },
+    .{ App, .endFrame },
 });
+
+/// Renders sprites, then cloud/fog sprites on top (in world space), to a texture.
+pub const renderScene = mach.schedule(.{
+    .{ App, .beginScenePass },
+    .{ gfx.Sprite, .render },
+});
+
+/// Renders the RTT sprite (post-processing: water reflections) to the back buffer, then text on top
+/// of everything (so it's not affected by water reflections).
+pub const renderComposite = mach.schedule(.{
+    .{ App, .beginCompositePass },
+    .{ gfx.Sprite, .render },
+    .{ gfx.Text, .render },
+});
+
+/// The pipelines rendering in the composite pass. The others use the default group, which renders
+/// in the scene pass. The RTT pipeline must not render there, since it samples the texture that
+/// pass renders into.
+const composite_group: gfx.RenderGroup = @fromBackingInt(1);
+
+const render_label = @tagName(mach_module) ++ ".render";
 
 const Scene = enum {
     none,
@@ -154,14 +206,10 @@ sfx_footsteps: mach.Audio.Opus,
 sfx_freeze: mach.Audio.Opus,
 sfx_grimble: mach.Audio.Opus,
 
-/// Whether setupPipelines has run (app thread only.)
-ready: bool = false,
-
-/// GPU resources created by the render thread, see setupGpu. Once `gpu_ready` is set (by the
-/// render thread), the app thread may read `gpu_res`. `gpu_res.rtt_texture`/`rtt_view` are only ever
+/// GPU resources created by the render thread, see setupGpu. Once `TickParams.gpu_ready` is set (by
+/// the render thread), the app thread may read `gpu_res`. `gpu_res.rtt_texture`/`rtt_view` are only ever
 /// replaced by the render thread, and the texture is handed to the app thread via `pending_rtt`.
 gpu_res: Gpu = undefined,
-gpu_ready: std.atomic.Value(bool) = .init(false),
 
 /// A newly (re)created render-to-texture texture, created by the render thread on resize and handed
 /// over to the app thread so that it can update the RTT sprite pipeline. Guarded by pending_rtt_mu.
@@ -234,10 +282,6 @@ const PendingRtt = struct {
 const RenderState = struct {
     ready: bool = false,
     scene: Scene = .none,
-    sprite_pipeline_id: mach.ObjectID = undefined,
-    text_pipeline_id: mach.ObjectID = undefined,
-    rtt_pipeline_id: mach.ObjectID = undefined,
-    cloud_pipeline_id: mach.ObjectID = undefined,
     world_time: f32 = 0,
 };
 
@@ -309,6 +353,7 @@ pub fn deinitApp(app: *App, ctx: mach.Context) void {
 
 pub fn deinit2(
     app: *App,
+    app_mod: mach.Mod(App),
     audio: *mach.Audio,
     sprite: *gfx.Sprite,
     text: *gfx.Text,
@@ -324,7 +369,9 @@ pub fn deinit2(
     app.parsed_atlas.deinit();
     app.parsed_level.deinit();
     app.parsed_ldtk_compatibility.deinit();
-    if (app.gpu_ready.load(.acquire)) {
+    // Created by the render thread, whether or not setupPipelines picked them up.
+    const tick_params = app_mod.scheduleParams(.tick);
+    if (tick_params.ready or tick_params.gpu_ready.load(.acquire)) {
         const g = app.gpu_res;
         g.rtt_view.release();
         g.rtt_texture.release();
@@ -335,13 +382,16 @@ pub fn deinit2(
 }
 
 /// Creates GPU resources. Called once on the render thread, since that is where all GPU work
-/// happens. The app thread picks these up in setupPipelines once `gpu_ready` is set.
-fn setupGpu(app: *App, window: anytype) !void {
-    const zone = mach.tracy.initZone(@src(), .{});
-    defer zone.deinit();
+/// happens. The app thread picks these up in setupPipelines once `TickParams.gpu_ready` is set.
+pub fn setupGpu(app: *App, app_mod: mach.Mod(App), core: *mach.Core, ctx: mach.Context) !void {
+    // Nothing to render yet: the app thread sets up pipelines once this is done.
+    ctx.schedule.params(RenderParams).needs_setup = false;
+    ctx.schedule.stop();
+
+    const window = core.windows.getValue(core.window);
     // Create the texture we'll render our scene to for post-processing effects.
     // Sized to the window's framebuffer (actual pixel dimensions including DPI scaling).
-    // Recreated on window resize in renderFrame.
+    // Recreated on window resize in beginFrame.
     const rtt_texture = createRttTexture(window.device, window.framebuffer_width, window.framebuffer_height);
 
     // Effect parameters for our custom sprite shaders, bound at @group(1) of their pipelines
@@ -379,7 +429,7 @@ fn setupGpu(app: *App, window: anytype) !void {
         .rtt_width = window.framebuffer_width,
         .rtt_height = window.framebuffer_height,
     };
-    app.gpu_ready.store(true, .release);
+    app_mod.scheduleParams(.tick).gpu_ready.store(true, .release);
 }
 
 fn createRttTexture(device: *gpu.Device, width: u32, height: u32) *gpu.Texture {
@@ -390,16 +440,14 @@ fn createRttTexture(device: *gpu.Device, width: u32, height: u32) *gpu.Texture {
     }));
 }
 
-/// Creates the render pipelines and loads the initial scene. Called on the app thread once the
-/// render thread has created our GPU resources.
-fn setupPipelines(
+/// Creates the render pipelines, once the render thread has created our GPU resources, and
+/// has the initial scene loaded.
+pub fn setupPipelines(
     app: *App,
-    app_mod: mach.Mod(App),
     sprite: *gfx.Sprite,
     text: *gfx.Text,
+    ctx: mach.Context,
 ) !void {
-    const zone = mach.tracy.initZone(@src(), .{});
-    defer zone.deinit();
     const g = app.gpu_res;
 
     // Create a sprite rendering pipeline. Created first so it renders before (beneath) the
@@ -438,6 +486,7 @@ fn setupPipelines(
     // drawing the scene texture as a single fullscreen sprite.
     app.rtt_pipeline_id = try sprite.pipelines.new(.{
         .window = app.window_id,
+        .render_group = composite_group,
         .texture = g.rtt_texture,
         .blend_state = gpu.BlendState{},
         .shader = g.pass1_shader,
@@ -455,13 +504,14 @@ fn setupPipelines(
     // Create a text rendering pipeline
     app.text_pipeline_id = try text.pipelines.new(.{
         .window = app.window_id,
+        .render_group = composite_group,
     });
 
-    app.ready = true;
-
-    // Load the initial starting screen scene (must be after pipelines are created
-    // since changeScene registers objects with them)
-    app_mod.call(.changeScene);
+    // Load the initial starting screen scene (changeScene registers objects with the pipelines.)
+    const params = ctx.schedule.params(TickParams);
+    params.gpu_ready.store(false, .release);
+    params.ready = true;
+    params.scene_changed = true;
 }
 
 /// Registers an object with a gfx.Sprite or gfx.Text pipeline's render list.
@@ -527,15 +577,10 @@ pub fn cleanupSprites(app: *App) void {
 
 /// Copies the app state the render thread needs. Runs while the app thread holds the render
 /// snapshot lock, so the render thread is not reading render_state concurrently.
-pub fn snapshot(app: *App) void {
-    if (!app.ready) return;
+pub fn snapshot(app: *App, ctx: mach.Context) void {
     app.render_state = .{
-        .ready = true,
+        .ready = ctx.schedule.params(TickParams).ready,
         .scene = app.scene,
-        .sprite_pipeline_id = app.sprite_pipeline_id,
-        .text_pipeline_id = app.text_pipeline_id,
-        .rtt_pipeline_id = app.rtt_pipeline_id,
-        .cloud_pipeline_id = app.cloud_pipeline_id,
         .world_time = app.world_time,
     };
 }
@@ -642,6 +687,8 @@ pub fn changeScene(
     text: *gfx.Text,
     ctx: mach.Context,
 ) !void {
+    const params = ctx.schedule.params(TickParams);
+    params.scene_changed = false;
     if (app.prev_scene == app.scene) return;
     ctx.info("changing scene: {s} -> {s}", .{ @tagName(app.prev_scene), @tagName(app.scene) });
 
@@ -651,6 +698,8 @@ pub fn changeScene(
     clearCurrentScene(app, audio, sprite, text);
     app.scene = next_scene;
     app.prev_scene = app.scene;
+    params.start_scene = app.scene == .start;
+    params.game_scene = app.scene == .game;
 
     switch (app.scene) {
         .none => {},
@@ -967,7 +1016,6 @@ pub fn updateAnims(
     app: *App,
     audio: *mach.Audio,
 ) !void {
-    if (!app.ready) return;
     const atlas = app.parsed_atlas.value;
 
     var sprites_iter = app.sprites.slice();
@@ -1022,7 +1070,6 @@ pub fn updateSfx(
     sprite: *gfx.Sprite,
     app: *App,
 ) !void {
-    if (!app.ready) return;
     // Update grimble positions — grimbles face and move toward the player
     const atlas = app.parsed_atlas.value;
     var sprites_iter = app.sprites.slice();
@@ -1059,10 +1106,7 @@ pub fn updateSfx(
 pub fn pollInput(
     core: *mach.Core,
     app: *App,
-    app_mod: mach.Mod(App),
-    sprite: *gfx.Sprite,
     audio: *mach.Audio,
-    text: *gfx.Text,
     overlay: *dvx.DevOverlay,
 ) !void {
     var direction = app.direction;
@@ -1083,7 +1127,7 @@ pub fn pollInput(
                     .left_shift => player_wants_to_run = true,
                     else => {},
                 }
-                if (app.ready and app.scene == .start and app.pending_scene == null) {
+                if (app.scene == .start and app.pending_scene == null) {
                     // Play our "Morning bells" sfx
                     try app.playSfx(audio, app.sfx_morning_bells, 1.0, null);
 
@@ -1108,10 +1152,6 @@ pub fn pollInput(
         }
     }
 
-    // Once the render thread has created our GPU resources, create our pipelines and scene.
-    if (!app.ready and app.gpu_ready.load(.acquire)) {
-        try setupPipelines(app, app_mod, sprite, text);
-    }
     app.last_direction = app.direction;
     app.direction = direction;
     app.player_wants_to_attack = player_wants_to_attack;
@@ -1123,12 +1163,12 @@ pub fn pollInput(
     mach.tracy.plot(f32, "app tick ms", dt * 1000);
 }
 
+/// Shows app info in the dev overlay, and requests the pending scene change once it's due.
 pub fn updateScene(
     app: *App,
-    app_mod: mach.Mod(App),
     overlay: *dvx.DevOverlay,
-) !void {
-    if (!app.ready) return;
+    ctx: mach.Context,
+) void {
     if (overlay.visible) {
         var app_sprites: usize = 0;
         var it = app.sprites.slice();
@@ -1142,14 +1182,8 @@ pub fn updateScene(
         if (app.pending_scene_timer.read() >= 2.0) {
             app.scene = next_scene;
             app.pending_scene = null;
-            app_mod.call(.changeScene);
+            ctx.schedule.params(TickParams).scene_changed = true;
         }
-    }
-
-    switch (app.scene) {
-        .none => {},
-        .start => app_mod.call(.updateSceneStart),
-        .game => app_mod.call(.updateSceneGame),
     }
 }
 
@@ -1308,7 +1342,6 @@ pub fn updateCamera(
     text: *gfx.Text,
     app: *App,
 ) !void {
-    if (!app.ready) return;
 
     // Our aim will be for our virtual canvas to be two thirds 1920x1080px. For our game, we do not
     // want the player to see more or less horizontally, as that may give an unfair advantage, but
@@ -1409,27 +1442,19 @@ pub fn updateCamera(
     }
 }
 
-/// Called on the render thread. Reads only the render snapshot (app.render_state and the
-/// render-side copies of gfx objects), never live app state.
-pub fn renderFrame(
-    core: *mach.Core,
-    sprite: *gfx.Sprite,
-    sprite_mod: mach.Mod(gfx.Sprite),
-    text: *gfx.Text,
-    text_mod: mach.Mod(gfx.Text),
-    overlay: *dvx.DevOverlay,
-    app: *App,
-) !void {
-    const label = @tagName(mach_module) ++ ".renderFrame";
+pub fn beginFrame(core: *mach.Core, app: *App, ctx: mach.Context) void {
     const window = core.windows.getValue(core.window);
 
-    // GPU resources are created here on the render thread; the app thread then sets up pipelines.
-    if (!app.gpu_ready.load(.acquire)) {
-        try app.setupGpu(window);
-        return;
-    }
     const rs = app.render_state;
-    if (!rs.ready) return;
+    if (!rs.ready) return ctx.schedule.stop();
+
+    // Grab the back buffer of the swapchain once per frame (can only be called once)
+    // TODO(core): this wouldn't exist in browser
+    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return ctx.schedule.stop();
+    ctx.schedule.put(.back_buffer, back_buffer_view, .{.release});
+
+    const encoder = window.device.createCommandEncoder(&.{ .label = render_label });
+    ctx.schedule.put(.encoder, encoder, .{.release});
 
     // Recreate the RTT texture if the framebuffer size changed, and hand it to the app thread
     // so it can update the RTT sprite pipeline.
@@ -1456,89 +1481,55 @@ pub fn renderFrame(
     window.queue.writeBuffer(app.gpu_res.effect_uniforms, 0, &[_]EffectUniforms{.{
         .params = vec4(rs.world_time, 0, 0, 0).gpu(),
     }});
+}
 
-    const encoder = window.device.createCommandEncoder(&.{ .label = label });
-    defer encoder.release();
+/// Begins a render pass that will render our scene to a texture (rtt == render to texture).
+pub fn beginScenePass(app: *App, ctx: mach.Context) void {
+    const dark_gray = gpu.Color{ .r = 0.106, .g = 0.11, .b = 0.118, .a = 1 };
+    const sky_blue = gpu.Color{ .r = 0.529, .g = 0.808, .b = 0.922, .a = 1 };
+    _ = sky_blue;
 
-    // Grab the back buffer of the swapchain once per frame (can only be called once)
-    // TODO(core): this wouldn't exist in browser
-    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return;
-    defer back_buffer_view.release();
+    const rtt_color_attachments = [_]gpu.RenderPassColorAttachment{.{
+        .view = app.gpu_res.rtt_view,
+        .clear_value = switch (app.render_state.scene) {
+            .none => dark_gray,
+            .start => dark_gray,
+            .game => dark_gray,
+        },
+        .load_op = .clear,
+        .store_op = .store,
+    }};
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
+    const render_pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+        .label = render_label,
+        .color_attachments = &rtt_color_attachments,
+    }));
+    ctx.schedule.put(.render_pass, render_pass, .{ .end, .release });
+}
 
-    // First render pass
-    {
-        const dark_gray = gpu.Color{ .r = 0.106, .g = 0.11, .b = 0.118, .a = 1 };
-        const sky_blue = gpu.Color{ .r = 0.529, .g = 0.808, .b = 0.922, .a = 1 };
-        _ = sky_blue;
+/// Begins a render pass that will render to the back buffer.
+pub fn beginCompositePass(ctx: mach.Context) void {
+    const color_attachments = [_]gpu.RenderPassColorAttachment{.{
+        .view = ctx.schedule.require(.back_buffer, *gpu.TextureView),
+        .clear_value = std.mem.zeroes(gpu.Color),
+        .load_op = .clear,
+        .store_op = .store,
+    }};
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
+    const render_pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+        .label = render_label,
+        .color_attachments = &color_attachments,
+    }));
+    ctx.schedule.put(.render_pass, render_pass, .{ .end, .release });
+    ctx.schedule.put(.render_group, composite_group, .{});
+}
 
-        // Begin a render pass that will render our scene to a texture (rtt == render to texture)
-        const rtt_color_attachments = [_]gpu.RenderPassColorAttachment{.{
-            .view = app.gpu_res.rtt_view,
-            .clear_value = switch (rs.scene) {
-                .none => dark_gray,
-                .start => dark_gray,
-                .game => dark_gray,
-            },
-            .load_op = .clear,
-            .store_op = .store,
-        }};
-        const render_pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
-            .label = label,
-            .color_attachments = &rtt_color_attachments,
-        }));
-
-        // Render sprites, then cloud/fog sprites on top (in world space). The RTT pipeline must
-        // not render here, since it samples the texture this pass renders into.
-        sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, null);
-        sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, render_pass);
-        sprite.pipelines.setRaw(rs.cloud_pipeline_id, .render_pass, render_pass);
-        sprite_mod.call(.render);
-
-        // Finish render pass
-        render_pass.end();
-        render_pass.release();
-    }
-
-    // Second render pass
-    {
-        // Begin second render pass
-        const color_attachments = [_]gpu.RenderPassColorAttachment{.{
-            .view = back_buffer_view,
-            .clear_value = std.mem.zeroes(gpu.Color),
-            .load_op = .clear,
-            .store_op = .store,
-        }};
-
-        const render_pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
-            .label = label,
-            .color_attachments = &color_attachments,
-        }));
-
-        // Render the RTT sprite (post-processing: water reflections). Only the RTT pipeline
-        // should render here.
-        sprite.pipelines.setRaw(rs.sprite_pipeline_id, .render_pass, null);
-        sprite.pipelines.setRaw(rs.cloud_pipeline_id, .render_pass, null);
-        sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, render_pass);
-        sprite_mod.call(.render);
-
-        // Render text on top of everything (so it's not affected by water reflections)
-        text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, render_pass);
-        text_mod.call(.render);
-
-        // Finish render pass
-        render_pass.end();
-        render_pass.release();
-    }
-
-    // Clear the transient render pass pointers, since the passes have been released.
-    sprite.pipelines.setRaw(rs.rtt_pipeline_id, .render_pass, null);
-    text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, null);
-
-    // Draw the dev overlay (if shown) on top of everything.
-    overlay.render(core, encoder, back_buffer_view, sprite, sprite_mod, text, text_mod);
+pub fn endFrame(core: *mach.Core, app: *App, ctx: mach.Context) !void {
+    const window = core.windows.getValue(core.window);
 
     // Finish the frame
-    var command = encoder.finish(&.{ .label = label });
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
+    var command = encoder.finish(&.{ .label = render_label });
     window.queue.submit(&[_]*gpu.CommandBuffer{command});
     command.release();
 

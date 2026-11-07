@@ -34,6 +34,9 @@ const budgets: Modules.InitOptions = .{ .budgets = .{
 } };
 
 // TODO: move this to a mach "entrypoint" zig module which handles nuances like WASM requires.
+/// Logs like the default, and with -Dtracy also sends every std.log message to Tracy.
+pub const std_options: std.Options = .{ .logFn = mach.logFn };
+
 pub fn main() !void {
     mach.tracy.setThreadName("main");
 
