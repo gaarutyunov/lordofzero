@@ -6,8 +6,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .mach = .{
-            .url = "git+https://github.com/gaarutyunov/mach#57acbfae559255fa11e6a2e39e550427f1056f9c",
-            .hash = "mach-0.5.0-jXwHfbB1PAD6GD2Vo2Gb-6pKFn2-ComWGRgi5uuYLHUk",
+            .url = "git+https://github.com/gaarutyunov/mach#7687d6adb1f1c0b8d8bd2d08c7a3500159d860b4",
+            .hash = "mach-0.5.0-jXwHfYOAPAAFs3alTQfmWfQzK7NJzSZTznW8x_oA3KbU",
         },
         .zigimg = .{
             .url = "git+https://github.com/zigimg/zigimg#083d0304840a3f5fd547c2e2005148a18886c401",
