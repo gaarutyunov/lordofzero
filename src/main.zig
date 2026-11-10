@@ -7,6 +7,7 @@ const Modules = mach.Modules(.{
     mach.gfx.Sprite,
     mach.gfx.Text,
     mach.dvx.DevOverlay,
+    mach.dvx.Inspector,
     mach.Audio,
     @import("App.zig"),
 });
