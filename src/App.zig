@@ -83,6 +83,7 @@ pub const deinit = mach.schedule(.{
     .{ dvx.DevOverlay, .deinit },
     .{ gfx.Sprite, .deinit },
     .{ gfx.Text, .deinit },
+    .{ dvx.Inspector, .deinit },
     .{ mach.Audio, .deinit },
 });
 

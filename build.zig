@@ -54,12 +54,13 @@ pub fn build(b: *std.Build) void {
     const lint_gpu = @import("mach").addGpuLint(b, mach_dep.builder, &.{"src"});
     b.step("lint-gpu", "Check that GPU resources get released").dependOn(&lint_gpu.step);
 
-    // The inspector: run the game with MACH_INSPECT=1, then `zig build inspector` to explore its
-    // modules, objects and GPU objects (or `zig build inspector -- path/to/mach-inspect.json`).
+    // The inspector: while the game runs (Debug), `zig build inspector` connects to it live to
+    // explore its modules, threads, objects and GPU objects (or opens a saved capture:
+    // `zig build inspector -- mach-capture-N.json`).
     const run_inspector = b.addRunArtifact(mach_dep.artifact("mach-inspector"));
     run_inspector.setCwd(b.path("."));
     run_inspector.addPassthruArgs();
-    b.step("inspector", "Explore the snapshot written by running with MACH_INSPECT=1").dependOn(&run_inspector.step);
+    b.step("inspector", "Connect to the running game and explore it live").dependOn(&run_inspector.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
