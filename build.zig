@@ -50,6 +50,18 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
 
+    // Static check that GPU resources acquired in a function get released.
+    const lint_gpu = @import("mach").addGpuLint(b, mach_dep.builder, &.{"src"});
+    b.step("lint-gpu", "Check that GPU resources get released").dependOn(&lint_gpu.step);
+
+    // The inspector: while the game runs (Debug), `zig build inspector` connects to it live to
+    // explore its modules, threads, objects and GPU objects (or opens a saved capture:
+    // `zig build inspector -- mach-capture-N.json`).
+    const run_inspector = b.addRunArtifact(mach_dep.artifact("mach-inspector"));
+    run_inspector.setCwd(b.path("."));
+    run_inspector.addPassthruArgs();
+    b.step("inspector", "Connect to the running game and explore it live").dependOn(&run_inspector.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
@@ -64,4 +76,5 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&lint_gpu.step);
 }

@@ -70,13 +70,20 @@ pub const main = mach.schedule(.{
     .{ gfx.Sprite, .init },
     .{ gfx.Text, .init },
     .{ dvx.DevOverlay, .init },
+    .{ dvx.Inspector, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
 
+/// Runs on exit, once rendering has stopped. GPU resources must be released before mach.Core
+/// releases the device (in Debug builds, the GPU tracker reports any that aren't).
 pub const deinit = mach.schedule(.{
     .{ App, .deinitApp },
     .{ App, .deinit2 },
+    .{ dvx.DevOverlay, .deinit },
+    .{ gfx.Sprite, .deinit },
+    .{ gfx.Text, .deinit },
+    .{ dvx.Inspector, .deinit },
     .{ mach.Audio, .deinit },
 });
 
@@ -105,6 +112,7 @@ pub const tick = mach.scheduleWith(TickParams, .{
     .{ App, .updateSfx, .ready },
     .{ App, .updateCamera, .ready },
     .{ dvx.DevOverlay, .update },
+    .{ dvx.Inspector, .tick },
     .{ App, .cleanup },
     .{ App, .snapshotFrame },
 });
@@ -267,11 +275,25 @@ const Gpu = struct {
     rtt_height: u32,
 };
 
-/// Must match `Effect` in pass1.wgsl and clouds.wgsl.
+/// Must match `Effect` in pass1.wgsl and clouds.wgsl (checked below).
 const EffectUniforms = extern struct {
     /// x = world time in seconds; yzw unused.
     params: gpu.Vec4 align(16),
 };
+
+/// Comptime reflection of our custom sprite shaders, see `mach.wgsl`.
+const pass1_wgsl = mach.wgsl.Shader("pass1.wgsl", @embedFile("pass1.wgsl"));
+const clouds_wgsl = mach.wgsl.Shader("clouds.wgsl", @embedFile("clouds.wgsl"));
+
+comptime {
+    // @group(0) is gfx.Sprite's, @group(1) is our effect bind group.
+    gfx.Sprite.checkShader(pass1_wgsl);
+    gfx.Sprite.checkShader(clouds_wgsl);
+    pass1_wgsl.checkHostType("effect", EffectUniforms);
+    clouds_wgsl.checkHostType("effect", EffectUniforms);
+    // Both pipelines share the effect bind group layout, derived from pass1.wgsl.
+    clouds_wgsl.checkLayout(1, &pass1_wgsl.layoutEntries(1));
+}
 
 const PendingRtt = struct {
     texture: *gpu.Texture,
@@ -378,7 +400,14 @@ pub fn deinit2(
         g.effect_bind_group.release();
         g.effect_bind_group_layout.release();
         g.effect_uniforms.release();
+        // The pipelines hold their own references to these.
+        g.atlas_texture.release();
+        g.pass1_shader.release();
+        g.clouds_shader.release();
     }
+    // A resized RTT texture the app thread never picked up.
+    if (app.pending_rtt) |rtt| rtt.texture.release();
+    app.pending_rtt = null;
 }
 
 /// Creates GPU resources. Called once on the render thread, since that is where all GPU work
@@ -403,24 +432,19 @@ pub fn setupGpu(app: *App, app_mod: mach.Mod(App), core: *mach.Core, ctx: mach.C
         .size = @sizeOf(EffectUniforms),
         .mapped_at_creation = .false,
     });
-    const effect_bind_group_layout = device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
-        .label = "effect",
-        .entries = &.{
-            gpu.BindGroupLayout.Entry.initBuffer(0, .{ .fragment = true }, .uniform, false, 0),
-        },
-    }));
+    const effect_bind_group_layout = device.createBindGroupLayout(&pass1_wgsl.layoutDescriptor(1, "effect"));
     const effect_bind_group = device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .label = "effect",
         .layout = effect_bind_group_layout,
-        .entries = &.{
-            gpu.BindGroup.Entry.initBuffer(0, effect_uniforms, 0, @sizeOf(EffectUniforms), @sizeOf(EffectUniforms)),
-        },
+        .entries = &pass1_wgsl.bindGroupEntries(1, .{
+            .effect = .{ .buffer = effect_uniforms, .size = @sizeOf(EffectUniforms) },
+        }),
     }));
 
     app.gpu_res = .{
         .atlas_texture = try loadTexture(window.device, window.queue, app.allocator, assets.lordofzero_png),
-        .pass1_shader = device.createShaderModuleWGSL("pass1.wgsl", @embedFile("pass1.wgsl")),
-        .clouds_shader = device.createShaderModuleWGSL("clouds.wgsl", @embedFile("clouds.wgsl")),
+        .pass1_shader = device.createShaderModuleWGSL(pass1_wgsl.file_name, @embedFile("pass1.wgsl")),
+        .clouds_shader = device.createShaderModuleWGSL(clouds_wgsl.file_name, @embedFile("clouds.wgsl")),
         .effect_uniforms = effect_uniforms,
         .effect_bind_group_layout = effect_bind_group_layout,
         .effect_bind_group = effect_bind_group,
